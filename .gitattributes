@@ -1,0 +1,12 @@
+# 统一行尾为 LF。
+# 不同编辑器写出来的行尾不一样, 混在一起 git 每次操作都刷警告,
+# 切分支时还会静默重写文件。这里钉死, 不再依赖 core.autocrlf 的默认值。
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.pdf binary
+*.zip binary
