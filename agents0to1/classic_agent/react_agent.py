@@ -127,7 +127,6 @@ class ReActAgent(Agent):
         # turn_start 之后才是本轮真正新产生的。
         messages = self._build_messages(input_text)
         turn_start = len(messages) - 1
-        messages.append({"role": "user", "content": input_text})
 
         for _step in range(1, self.max_steps + 1):
             for chunk in self._stream_chat(messages, tools=tools, **kwargs):

@@ -30,8 +30,18 @@
 ## 上手
 
 ```bash
-pip install -r requirements.txt
+git clone git@github.com:YuLuoxia-lzy/hand-roll_an_agent.git
+cd hand-roll_an_agent
+pip install -e .
 ```
+
+只想装依赖、不想把框架装进环境的话，`pip install -r requirements.txt` 也行，但那样 `examples/` 里的脚本会 import 不到包。
+
+```bash
+cp .env.example .env                       # 把 key 填进去
+```
+
+习惯用环境变量的话，`.env` 可以不要：
 
 ```bash
 export DEEPSEEK_API_KEY=sk-xxxxxxxx        # Linux / macOS
@@ -39,21 +49,29 @@ export DEEPSEEK_API_KEY=sk-xxxxxxxx        # Linux / macOS
 
 然后就能跑了 哈哈
 
+```bash
+python examples/simple_chat.py
+```
+
+`python -m examples.run_all` 是个菜单，四种 Agent 挑着跑，这条连包都不用装。
+
 ## 项目结构
 
 ```
-Agent_0_to_1/
-├── core/                # 基类与基础设施
-│   ├── agent.py         #   Agent 基类：拼消息、调 LLM、管历史
-│   ├── llm.py           #   多厂商 LLM 客户端
-│   ├── types.py         #   ToolCall / LLMResponse / AgentEvent
-│   ├── config.py        #   配置
-│   ├── message.py       #   历史消息
-│   └── exceptions.py    #   异常体系
-├── classic_agent/       # 四种 Agent 范式
-├── tools/               # 工具系统：注册表、内置工具、工具链、并行执行
-├── utils/               # 日志等
-└── test/classic_test/   # 手动跑的示例脚本
+hand-roll_an_agent/       # 仓库名带横线，不能直接 import，所以包在里面一层
+├── agents0to1/           # 真正被 import 的那个包
+│   ├── core/             #   基类与基础设施
+│   │   ├── agent.py      #     Agent 基类：拼消息、调 LLM、管历史
+│   │   ├── llm.py        #     多厂商 LLM 客户端
+│   │   ├── typedefs.py   #     ToolCall / LLMResponse / AgentEvent
+│   │   ├── config.py     #     配置
+│   │   ├── message.py    #     历史消息
+│   │   └── exceptions.py #     异常体系
+│   ├── classic_agent/    #   四种 Agent 范式
+│   ├── tools/            #   工具系统：注册表、内置工具、工具链、并行执行
+│   └── utils/            #   日志等
+├── examples/             # 手动跑的示例脚本
+└── docs/                 # 设计笔记
 ```
 
 ## 接下来
@@ -80,6 +98,7 @@ Agent_0_to_1/
 - `AgentEvent` 新增 `thinking` 类型，用于区分过程叙述与最终答案。
 - `core/types.py` 更名为 `core/typedefs.py`。
 - provider 检测在多个 key 同时存在时给出告警，并以 `base_url` 判定。
+- 重构了文件的结构，之前直接git 会因为名称不一致导致出现问题。
 
 ## 协议
 

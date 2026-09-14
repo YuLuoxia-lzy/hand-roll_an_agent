@@ -5,21 +5,41 @@ Agents0to1 - 灵活、可扩展的多智能体框架
 """
 
 import os
+from pathlib import Path
 
 
 def _load_dotenv() -> bool:
     """
-    可选加载同目录下的 .env。
+    可选加载 .env。
 
     装了 python-dotenv 才生效, 没装就静默跳过 —— 不为了读一个 .env 文件
     就给框架强加一个硬依赖。放在最前面调用, 这样后面所有读 os.getenv 的代码
     (模型名、密钥、base_url、LOG_LEVEL) 都能吃到 .env 里的值。
+
+    找两个地方, 按顺序:
+    1. 当前工作目录向上找 —— 你在自己的项目里跑脚本时, .env 通常在那儿
+    2. 仓库根目录下的 .env —— 克隆本仓库、在仓库外面跑脚本的场景
+
+    两处都没有就什么都不做, 继续用系统环境变量。
     """
     try:
-        from dotenv import load_dotenv
+        from dotenv import find_dotenv, load_dotenv
     except ImportError:
         return False
-    return load_dotenv()
+
+    path = find_dotenv(usecwd=True)
+    if path:
+        return load_dotenv(path)
+
+    # 这里直接按 __file__ 推仓库根, **不用** find_dotenv() 的默认行为:
+    # 它靠调用栈往上找一个"真实存在的文件"当起点, 从 `python -c`、交互式
+    # 解释器或某些打包环境里调用时会认错起点, 静默返回空。
+    # 装进 site-packages 时这个路径下面不会真有 .env, 所以也安全。
+    repo_env = Path(__file__).resolve().parent.parent / ".env"
+    if repo_env.is_file():
+        return load_dotenv(repo_env)
+
+    return False
 
 
 _load_dotenv()

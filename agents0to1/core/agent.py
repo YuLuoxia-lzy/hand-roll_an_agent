@@ -281,6 +281,10 @@ class Agent(ABC):
     #
     # 存的是**轨迹**
     #
+    # 下面几处类型注解用的是 PEP 604 的 str | Path, 这是 3.10 的语法。
+    # 函数注解在 def 执行时求值, 所以 3.9 上 import 这个模块会直接 TypeError。
+    # pyproject 里的 requires-python 已经同步成 ">=3.10", 两边别改岔了。
+    #
 
     SNAPSHOT_VERSION = 1
 

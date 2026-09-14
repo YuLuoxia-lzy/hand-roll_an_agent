@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,20 @@ name = "agents0to1"
 version = "0.1.1"
 description = "灵活、可扩展的多智能体框架"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["agent", "llm", "openai", "react", "multi-agent"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
 dependencies = [
     "openai>=1.0.0",
     "pydantic>=2.0.0",
@@ -19,7 +32,7 @@ search = [
     "tavily-python",
     "google-search-results",
 ]
-# .env 文件的读取也是可选的 —— 装了 __init__.py 会自动加载, 没装就跳过
+# .env 文件的读取也是可选的 —— 装了 agents0to1/__init__.py 会自动加载, 没装就跳过
 dotenv = ["python-dotenv"]
 all = [
     "tavily-python",
@@ -27,13 +40,12 @@ all = [
     "python-dotenv",
 ]
 
-[tool.setuptools]
-# 只打包框架本身
-packages = [
-    "Agent_0_to_1",
-    "Agent_0_to_1.core",
-    "Agent_0_to_1.classic_agent",
-    "Agent_0_to_1.tools",
-    "Agent_0_to_1.tools.builtin",
-    "Agent_0_to_1.utils",
-]
+[project.urls]
+Homepage = "https://github.com/YuLuoxia-lzy/hand-roll_an_agent"
+Repository = "https://github.com/YuLuoxia-lzy/hand-roll_an_agent"
+Issues = "https://github.com/YuLuoxia-lzy/hand-roll_an_agent/issues"
+
+[tool.setuptools.packages.find]
+# 仓库根目录叫 hand-roll_an_agent(带连字符, 不能当包名), 所以包放在里层的 agents0to1/。
+# 这里只收 agents0to1 及其子包, examples/ docs/ 不会被误当成包打进去。
+include = ["agents0to1*"]

@@ -8,7 +8,11 @@ class Config(BaseModel):
     """Agents0to1配置类"""
     
     # LLM配置
-    default_model: str = "deepseek-chat"
+    # 默认 None = "没指定", 由 Agents0to1 按 provider 挑对应的默认模型
+    # (deepseek -> deepseek-chat, openai -> gpt-3.5-turbo, ...)。
+    # 这里**不能**写死 "deepseek-chat": 写死之后换 provider 也还是发 deepseek-chat,
+    # 报一个看不懂的 400; 而且 LLM_MODEL_ID 环境变量会被这个硬编码值压住, 永远不生效。
+    default_model: Optional[str] = None
     # "没指定, 让框架自动检测"。必须写成 Optional[str]: None 是它的正常取值,
     default_provider: Optional[str] = None
     temperature: float = 0.7

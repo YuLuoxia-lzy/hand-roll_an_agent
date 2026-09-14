@@ -62,7 +62,9 @@ class Agents0to1:
             config: 默认参数配置
         """
         self.config = config or Config() 
-        self.model = model or self.config.default_model or os.getenv("LLM_MODEL_ID") 
+        # 优先级: 显式传的 model > Config.default_model > LLM_MODEL_ID 环境变量。
+        # 三者都为空时先留 None, 交给下面 `if not self.model` 那个分支按 provider 挑。
+        self.model = model or self.config.default_model or os.getenv("LLM_MODEL_ID")
         self.temperature = temperature if temperature is not None else self.config.temperature # 必须 is not None, 0 是合法值, or 会把它吞掉
         self.max_tokens = max_tokens if max_tokens is not None else self.config.max_tokens
         self.timeout = timeout or int(os.getenv("LLM_TIMEOUT", "60"))

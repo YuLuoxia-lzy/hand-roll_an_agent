@@ -1,17 +1,21 @@
+# 只想装依赖、不装框架本包的话用它:  pip install -r requirements.txt
+# 装了包的话 `pip install -e ".[all]"` 是等价的 —— 依赖同时声明在 pyproject.toml 里,
+# 这份是给"不想把包装进环境"的人准备的。
+
 # ==================== 核心依赖 ====================
 # 这两个是必需的, 没有就跑不起来
 openai>=1.0.0
 pydantic>=2.0.0
 
 # ==================== 可选依赖 ====================
-# 下面这些都**不是**必需的, 按需取消注释安装。
+# 下面这三个不装也能用框架, 不想要就注释掉
 
 # --- 搜索工具的后端 ---
-# 不装也能用框架, 只是 SearchTool 没有任何可用后端, 调用它会返回一段配置提示
-# tavily-python
-# google-search-results
+# 不装的话 SearchTool 没有任何可用后端, 调用它会返回一段配置提示
+tavily-python
+google-search-results
 
 # --- 自动加载 .env 文件 ---
-# 装了的话, import Agent_0_to_1 时会自动读取同目录的 .env;
+# 装了的话, import agents0to1 时会自动找 .env (先按当前工作目录, 再退回包目录向上找);
 # 没装就静默跳过, 你可以继续用系统环境变量
-# python-dotenv
+python-dotenv

@@ -144,7 +144,7 @@ global_registry = ToolRegistry()
 #
 # 想注册一个简单工具, 现在统一写成:
 #
-#     from Agent_0_to_1.tools import Tool, ToolParameter
+#     from agents0to1.tools import Tool, ToolParameter
 #
 #     class EchoTool(Tool):
 #         def __init__(self):
