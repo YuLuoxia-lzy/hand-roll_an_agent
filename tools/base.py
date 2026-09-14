@@ -14,11 +14,43 @@ class ToolParameter(BaseModel):
 
 class Tool(ABC):
     """工具基类"""
-    
+
+    # 单次结果的字符上限, 子类可覆盖。按 2 字符 ≈ 1 token 粗估(中文放宽到 1:1),
+    # 6000 字符 ≈ 3000 token —— 够装一份长文档的开头结尾, 又不至于一轮就撑爆上下文。
+    max_output_chars: int = 6000
+
+    # 截断保留的尾部长度: 结论、报错、命令输出常常在末尾, 只砍尾巴会丢掉最有用的部分
+    _TAIL_CHARS: int = 800
+
     def __init__(self, name: str, description: str):
         self.name = name
         self.description = description
-    
+
+    @classmethod
+    def truncate_output(cls, text: str) -> str:
+        """
+        超过上限就保留头尾、中间省略, 并且**明确告诉模型这是被截断过的**。
+        不标记是最坏的做法: 模型分不清"这就是全部"和"这是被砍过的",
+        """
+        limit = cls.max_output_chars
+        if not isinstance(text, str) or limit <= 0 or len(text) <= limit:
+            return text
+
+        omitted = len(text) - limit
+        tail_len = min(cls._TAIL_CHARS, limit // 3)
+        head_len = max(limit - tail_len, 1)
+        head, tail = text[:head_len], text[-tail_len:] if tail_len else ""
+
+        # 尽量切在行边界上, 别把一行/一个 URL 拦腰截断
+        cut = head.rfind("\n")
+        if cut > head_len * 0.6:
+            head = head[:cut]
+        cut = tail.find("\n")
+        if 0 <= cut < len(tail) * 0.4:
+            tail = tail[cut + 1:]
+
+        return f"{head}\n\n...[已截断, 省略 {omitted} 字符]...\n\n{tail}"
+
     @abstractmethod
     def run(self, parameters: Dict[str, Any]) -> str:
         """执行工具"""
@@ -36,12 +68,11 @@ class Tool(ABC):
 
     def validate_arguments(self, arguments: Dict[str, Any]) -> Optional[str]:
         """
-        【新】校验模型给的参数, 供 registry.execute() 调用。
+        校验模型给的参数, 供 registry.execute() 调用。
 
         与上面的 validate_parameters 的区别:
         - validate_parameters 只返回 True/False —— 调用方不知道"缺了什么"
         - validate_arguments 返回 None(通过) 或具体的错误信息字符串。
-          这条错误信息会作为工具结果回传给模型, 模型看了就知道该补哪个参数。
         """
         if not isinstance(arguments, dict):
             return f"参数格式错误: 期望字典, 实际是 {type(arguments).__name__}"

@@ -4,7 +4,7 @@
 
 from typing import Optional
 from ..core.exceptions import *
-from ..core.types import ToolCall          # 【新】模型发出的工具调用请求(结构化)
+from ..core.typedefs import ToolCall          # 【新】模型发出的工具调用请求(结构化)
 from .base import Tool
 from ..utils.logging import get_logger
 
@@ -17,8 +17,6 @@ class ToolRegistry:
     提供工具的注册、管理和执行功能。
 
     只有一种注册方式: register_tool(Tool 实例)。
-    正则时代还支持"直接注册一个 Callable[[str], str] 函数", 那套机制已随
-    execute_tool 一起删掉了 —— 原因见文件末尾的说明。
     """
 
     def __init__(self):
@@ -53,23 +51,16 @@ class ToolRegistry:
 
     def get_tools_schema(self) -> list[dict]:
         """
-        【新】获取所有工具的 JSON Schema 列表 —— Agent 循环的入口
-
-        用法:
+        获取所有工具的 JSON Schema 列表 —— Agent 循环的入口
             response = llm.invoke(messages, tools=registry.get_tools_schema())
-
         注意返回的是 list: OpenAI 的 tools 参数要"工具列表", 哪怕只有一个工具也要包在 [] 里
-        (传单个 dict 会报 400: tools: invalid type: map, expected a sequence)
         """
         return [tool.to_openai_schema() for tool in self._tools.values()]
 
     def execute(self, call: ToolCall) -> str:
         """
-        【新】执行模型请求的工具调用
-
-        Args:
+        执行模型请求的工具调用
             call: 模型返回的结构化工具调用(含 name 和已解析成字典的 arguments)
-
         Returns:
             工具执行结果字符串。失败时返回"错误: xxx"而不是抛异常 ——
             因为返回值会作为 tool 消息回传给模型, 模型看到错误能自己换个参数重试。
@@ -85,13 +76,18 @@ class ToolRegistry:
             return f"错误:{error}"
 
         try:
-            # 参数是结构化字典(不再是"2 + 2"这种字符串), 直接整体传给工具
-            return tool.run(call.arguments)
+            raw = tool.run(call.arguments)
         except Exception as e:
             return f"错误：执行工具 '{call.name}' 时发生异常: {str(e)}"
 
+        # 长度上限在这里施加, 而不是让每个工具自己记得调 —— 这是所有工具结果的
+        # 唯一出口, 放在这儿才不会有漏网的。必须在结果进入 messages **之前**做:
+        # 一旦写进轨迹, 它就成了"模型当年看到的"，事后再裁剪会让轨迹和真实请求对不上。
+        return tool.truncate_output(raw)
+
+
     # ==================== 旧: 工具描述文本(被 get_tools_schema 取代) ====================
-    # 这是正则时代的做法: 把工具描述拼成一段文字塞进提示词, 让模型"照着文字说"要用哪个工具。
+    # 把工具描述拼成一段文字塞进提示词, 让模型"照着文字说"要用哪个工具。
     # function calling 下工具的说明走 API 的 tools 参数(JSON Schema), 不再需要这段文字。
     # def get_tools_description(self) -> str:
     #     """

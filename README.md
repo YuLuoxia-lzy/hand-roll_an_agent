@@ -67,6 +67,20 @@ Agent_0_to_1/
 - [ ] 更多内置工具
 - [ ] 其实我更想做一个赛博小镇 这也是学hello agent的一个原因
 
+## 更新日志
+
+### 2026-09-14
+
+主要变更：
+
+- ReAct 的工具调用由正则解析改为 function calling，工具参数改为结构化字典。
+- 所有 LLM 调用统一经 `Agent._chat`，修复 `system_prompt` 未注入的问题。
+- 历史改为以 Turn 为单位截断，避免 `tool_calls` 与 `tool` 消息的配对被切断；
+- 新增快照 `save` / `load` / `fork`，可从同一份快照分出互不影响的实例。
+- `AgentEvent` 新增 `thinking` 类型，用于区分过程叙述与最终答案。
+- `core/types.py` 更名为 `core/typedefs.py`。
+- provider 检测在多个 key 同时存在时给出告警，并以 `base_url` 判定。
+
 ## 协议
 
 MIT

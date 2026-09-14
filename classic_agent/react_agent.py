@@ -7,7 +7,7 @@ from typing import Iterator, Optional, List
 from ..core.agent import Agent
 from ..core.llm import Agents0to1
 from ..core.config import Config
-from ..core.types import AgentEvent, LLMResponse, ToolCall
+from ..core.typedefs import AgentEvent, ToolCall
 from ..tools.registry import ToolRegistry
 from ..tools.async_executor import execute_many_sync
 from ..utils.logging import get_logger
@@ -73,6 +73,13 @@ class ReActAgent(Agent):
         # 最近一次运行的完整对话, 便于调试时回看"模型当时看到了什么"
         self.last_messages: List[dict] = []
 
+    def _snapshot_state(self) -> dict:
+        """
+        把构造参数交给快照 —— 不存的话, fork 出来的 agent 会悄悄退回默认 max_steps
+        和默认提示词, 而"悄悄退回默认值"是最难发现的一类偏差。
+        """
+        return {"max_steps": self.max_steps, "custom_prompt": self.prompt_template}
+
     def _system_content(self) -> str:
         """
         人设 + 工作方式说明, 合成一条 system 消息。
@@ -110,15 +117,19 @@ class ReActAgent(Agent):
         流式运行ReAct Agent, 边跑边吐事件。
 
         一轮里的事件顺序:
-            text*  ->  tool_call+  ->  tool_result+  ->  (下一轮)  ->  final
+            没有工具:  text*  ->  final
+            有工具:    thinking?  ->  tool_call+  ->  tool_result+  ->  (下一轮)
 
-        【请完整消费这个生成器】提前 break 会让: 本轮工具不执行、历史不记录。
         """
-        messages = self._build_messages(input_text)
         tools = self._tools_schema()
 
+        # messages 的前 [0:turn_start) 是**从历史里拼进来的上一轮内容**,
+        # turn_start 之后才是本轮真正新产生的。
+        messages = self._build_messages(input_text)
+        turn_start = len(messages) - 1
+        messages.append({"role": "user", "content": input_text})
+
         for _step in range(1, self.max_steps + 1):
-            # 1. 流式要正文 —— 逐块吐给调用方
             for chunk in self._stream_chat(messages, tools=tools, **kwargs):
                 yield AgentEvent(type="text", text=chunk)
 
@@ -126,47 +137,64 @@ class ReActAgent(Agent):
             response = self._last_response
             if response is None:
                 # 正常跑完上面的 for 一定会有值。真为 None 说明服务端一个块都没发,
-                # 与其抛异常不如用空答案收尾 —— 至少把历史记上。
                 logger.warning("流式响应为空, 提前结束本轮。")
-                self._finish(input_text, "", messages)
+                self._append_assistant_message(messages, "")
+                self._finish(input_text, "", messages, turn_start)
                 yield AgentEvent(type="final", answer="")
                 return
 
+            text = response.content or ""
+
             # 3. 模型不再请求工具 -> 这就是最终答案, 循环结束
             if not response.has_tool_calls:
-                answer = response.content or ""
-                self._finish(input_text, answer, messages)
-                yield AgentEvent(type="final", answer=answer)
+                self._append_assistant_message(messages, text)
+                self._finish(input_text, text, messages, turn_start)
+                yield AgentEvent(type="final", answer=text)
                 return
 
-            # 4. 模型请求了工具 -> 先把它这轮的请求记进对话
-            self._append_assistant_tool_calls(messages, response)
+            # 4. 模型请求了工具 -> 它这轮说的正文是**过程叙述**, 不是最终答案。
+            #    先吐 thinking, 再吐工具事件 —— 和模型"先想后做"的顺序一致。
+            if text:
+                yield AgentEvent(type="thinking", text=text)
+
+            # 5. 把这轮的请求记进对话。注意 content 用的是同一个 text 变量,
+            #    函数自己也**不能再从 response 里取一遍**(所以签名改成了收 text)。
+            self._append_assistant_tool_calls(messages, text, response.tool_calls)
 
             for call in response.tool_calls:
                 yield AgentEvent(type="tool_call", call=call)
 
-            # 5. 并行执行工具, 把每个结果作为 tool 消息回传
+            # 6. 并行执行工具, 把每个结果作为 tool 消息回传
             pairs = self._execute_tool_calls(messages, response.tool_calls)
 
             for call, result in pairs:
                 yield AgentEvent(type="tool_result", call=call, result=result)
 
-        # 6. 步数用完(模型一直在调工具停不下来) -> 兜底
-        self._finish(input_text, MAX_STEPS_ANSWER, messages)
+        # 7. 步数用完(模型一直在调工具停不下来) -> 兜底
+        self._append_assistant_message(messages, MAX_STEPS_ANSWER)
+        self._finish(input_text, MAX_STEPS_ANSWER, messages, turn_start)
         yield AgentEvent(type="final", answer=MAX_STEPS_ANSWER)
 
     # ==================== 内部方法 ====================
 
-    def _append_assistant_tool_calls(self, messages: List[dict], response: LLMResponse):
+    def _append_assistant_message(self, messages: List[dict], text: str):
+        """
+        把模型这轮的最终答复记进工作列表。
+        user -> assistant(tool_calls) -> tool -> assistant。
+        """
+        messages.append({"role": "assistant", "content": text})
+
+    def _append_assistant_tool_calls(self, messages: List[dict], text: str, calls: List[ToolCall]):
         """
         把模型的工具请求记成一条 assistant 消息。
 
         格式必须与 API 返回的一致: arguments 要重新序列化成 JSON 字符串。
         这条消息不能省 —— 否则下一轮模型看到 tool 消息时, 会不知道自己什么时候请求过。
+
         """
         messages.append({
             "role": "assistant",
-            "content": response.content or "",
+            "content": text,
             "tool_calls": [
                 {
                     "id": call.id,
@@ -176,7 +204,7 @@ class ReActAgent(Agent):
                         "arguments": json.dumps(call.arguments, ensure_ascii=False),
                     },
                 }
-                for call in response.tool_calls
+                for call in calls
             ],
         })
 
@@ -200,14 +228,16 @@ class ReActAgent(Agent):
             pairs.append((call, result))
         return pairs
 
-    def _finish(self, input_text: str, final_answer: str, messages: List[dict]) -> str:
-        """收尾: 记录轨迹与对话历史, 返回答案"""
+    def _finish(self, input_text: str, final_answer: str, messages: List[dict], turn_start: int) -> str:
+        """
+        收尾: 记录轨迹与对话历史, 返回答案。
+        """
         self.last_messages = messages
-        self._record_turn(input_text, final_answer)
+        self._record_turn(input_text, final_answer, messages=messages[turn_start:])
         return final_answer
 
 
-# ==================== 旧版本(正则时代) - 注释保留, 仅供参考 ====================
+# ==================== 旧版本 - 注释保留, 仅供参考 ====================
 # 旧版的根本问题:
 # 1. 用自然语言当程序协议 —— 提示词要求 "Action: tool[input]", 代码用正则去挖。
 #    模型是人不是编译器, 中文冒号、多空格、加句废话都会让正则扑空。

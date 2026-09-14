@@ -14,10 +14,6 @@ class CalculatorTool(Tool):
     """Python计算器工具"""
 
     # 乘方护栏: 指数绝对值超过这个数就拒绝计算。
-    # 为什么必须有: 9**9**9 的指数是 387420489, Python 会老老实实去构造一个
-    # 3.8 亿位的大整数 —— 进程直接卡死, 内存飙升, 几百秒都没有反应。
-    # 模型很容易一本正经地生成这种表达式(它在纸上算不出来, 就交给工具算),
-    # 所以必须在**开始算之前**拦住, 算到一半再拦已经来不及了。
     MAX_EXPONENT = 1000
 
     # 支持的操作符
@@ -27,11 +23,9 @@ class CalculatorTool(Tool):
         ast.Mult: operator.mul,
         ast.Div: operator.truediv,
         # 整除和取余: 模型的输出里很常见(AI 算"每3人一组能分几组"就会写 //),
-        # 之前不在表里, 会撞出一个 KeyError, 报错信息对模型毫无帮助。
         ast.FloorDiv: operator.floordiv,
         ast.Mod: operator.mod,
         # 注意: 这里**故意不放** ast.BitXor。'^' 在 Python 里是按位异或,
-        # 而几乎所有人都以为它是乘方, 见 _eval_node 里的处理。
         ast.USub: operator.neg,
     }
     
@@ -61,10 +55,8 @@ class CalculatorTool(Tool):
     def run(self, parameters: Dict[str, Any]) -> str:
         """
         执行计算
-
         Args:
             parameters: 包含input参数的字典
-
         Returns:
             计算结果
         """
@@ -91,20 +83,11 @@ class CalculatorTool(Tool):
 
     def _eval_node(self, node):
         """递归计算AST节点"""
-        if isinstance(node, ast.Constant):  # Python 3.8+ 数字/字符串都是 Constant
+        if isinstance(node, ast.Constant):  
             return node.value
-        # 这里原来还有一条 `elif isinstance(node, ast.Num): return node.n`(给 Python 3.8 以前用)。
-        # 已删除: ast.Num 从 3.12 起标记废弃、3.14 会彻底移除, 光是**引用**它就会发
-        # DeprecationWarning —— 本项目的测试配置把废弃警告当错误, 于是每个非常量节点
-        # (比如 2+3*4 里的 BinOp)都会在走到这一行时直接炸。
-        # 本项目要求 Python >= 3.9, ast.Constant 已经完全覆盖, 这个分支是纯粹的死代码。
         elif isinstance(node, ast.BinOp):
             op_type = type(node.op)
 
-            # '^' 在 Python 里是【按位异或】: 2^3 算出 1, 不是 8。
-            # 模型说"计算 2 的 3 次方"时经常写成 2^3, 直接算出 1 会让它
-            # 拿着一个错答案继续往下推理, 而且完全看不出哪里错了。
-            # 所以宁可报错, 把正确写法告诉它。
             if op_type is ast.BitXor:
                 raise ValueError(
                     f"'^' 在 Python 里是按位异或, 不是乘方。"
@@ -164,12 +147,10 @@ class CalculatorTool(Tool):
 def calculate(expression: str) -> str:
     """
     执行数学计算
-
     Args:
         expression: 数学表达式
-
     Returns:
         计算结果字符串
     """
     tool = CalculatorTool()
-    return tool.run({"input": expression})
+    return tool.truncate_output(tool.run({"input": expression}))

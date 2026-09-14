@@ -12,7 +12,6 @@ logger = get_logger(__name__)
 class SearchTool(Tool):
     """
     智能混合搜索工具
-
     支持多种搜索引擎后端，智能选择最佳搜索源：
     1. 混合模式 (hybrid) - 智能选择TAVILY或SERPAPI
     2. Tavily API (tavily) - 专业AI搜索
@@ -249,20 +248,20 @@ def search(query: str, backend: str = "hybrid") -> str:
         搜索结果
     """
     tool = SearchTool(backend=backend)
-    return tool.run({"input": query})
+    return tool.truncate_output(tool.run({"input": query}))
 
 # 专用搜索函数
 def search_tavily(query: str) -> str:
     """使用Tavily进行AI优化搜索"""
     tool = SearchTool(backend="tavily")
-    return tool.run({"input": query})
+    return tool.truncate_output(tool.run({"input": query}))
 
 def search_serpapi(query: str) -> str:
     """使用SerpApi进行Google搜索"""
     tool = SearchTool(backend="serpapi")
-    return tool.run({"input": query})
+    return tool.truncate_output(tool.run({"input": query}))
 
 def search_hybrid(query: str) -> str:
     """智能混合搜索，自动选择最佳搜索源"""
     tool = SearchTool(backend="hybrid")
-    return tool.run({"input": query})
+    return tool.truncate_output(tool.run({"input": query}))

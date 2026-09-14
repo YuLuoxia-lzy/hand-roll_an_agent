@@ -4,8 +4,8 @@ from .llm import Agents0to1
 from .exceptions import *
 from .agent import Agent
 from .config import Config
-from .message import Message
-from .types import*
+from .message import Message, Turn
+from .typedefs import*
 
 __all__ = [
     "Agents0to1",
@@ -18,6 +18,7 @@ __all__ = [
     "Agent",
     "Config",
     "Message",
+    "Turn",
     "ToolCall",
     "LLMResponse",
     "AgentEvent",           # 流式事件, 调用 stream_run 时用

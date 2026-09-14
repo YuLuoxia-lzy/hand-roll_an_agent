@@ -3,7 +3,7 @@
 """
 
 from typing import List, Dict, Any, Optional
-from ..core.types import ToolCall
+from ..core.typedefs import ToolCall
 from .registry import ToolRegistry
 
 

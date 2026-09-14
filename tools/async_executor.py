@@ -5,7 +5,7 @@
 import asyncio
 import concurrent.futures
 from typing import List
-from ..core.types import ToolCall
+from ..core.typedefs import ToolCall
 from .registry import ToolRegistry
 
 
@@ -33,18 +33,14 @@ class AsyncToolExecutor:
     async def execute_many(self, calls: List[ToolCall]) -> List[str]:
         """
         并行执行模型一轮请求的多个工具调用。
-
         Args:
             calls: 模型这一轮返回的全部 tool_calls
-
         Returns:
             结果列表, 顺序与 calls 严格一一对应(方便 zip 回 tool_call_id)
         """
         if not calls:
             return []
 
-        # asyncio.gather 会同时调度所有协程 —— 这才是真正的并行。
-        # 旧版是一个 for 循环里逐个 await, 那其实是串行(见文件末尾说明)。
         return await asyncio.gather(*(self.execute_async(call) for call in calls))
 
     def close(self):
@@ -78,20 +74,10 @@ def execute_many_sync(
     max_workers: int = 4,
 ) -> List[str]:
     """
-    并行执行多个工具调用, 同步版本 —— ReActAgent 走的就是这条路。
+    并行执行多个工具调用, 同步版本 。
 
-    为什么不用 run_parallel_tools_sync: 它内部是 asyncio.run(), 而 asyncio.run
-    在**已经处于事件循环中**的代码里调用会直接抛
-    "RuntimeError: asyncio.run() cannot be called from a running event loop"。
-    Jupyter notebook、FastAPI 之类的 async 应用里全都踩这个坑。
-    这里改用纯 ThreadPoolExecutor, 不碰事件循环, 任何环境都能调。
-
-    返回结果**严格按 calls 的顺序**排列(不是完成顺序):
+    返回结果严格按 calls 的顺序排列(不是完成顺序):
     结果要靠 zip 回 tool_call_id 配对, 顺序错位就会把 A 工具的结果当成 B 的。
-    所以用列表推导按序取 f.result(), 而不是 as_completed。
-
-    工具本身抛异常不会冒泡 —— registry.execute 内部已经兜住了, 返回错误串。
-    这里仍然再包一层: 万一兜底逻辑本身出问题, 也不能让整轮对话崩掉。
     """
     if not calls:
         return []
@@ -107,7 +93,6 @@ def execute_many_sync(
             try:
                 results.append(future.result())
             except Exception as e:
-                # 正常情况下走不到这里(registry.execute 不抛), 属于最后一道防线
                 results.append(f"错误: 工具 '{call.name}' 执行失败: {e}")
         return results
 
@@ -119,9 +104,6 @@ def run_parallel_tools_sync(
 ) -> List[str]:
     """
     同步版本, 供非 async 环境使用。
-
-    现在委托给 execute_many_sync(纯线程池), 不再走 asyncio.run,
-    因此它也可以安全地在已有事件循环的环境里调用。
     """
     return execute_many_sync(registry, calls, max_workers)
 

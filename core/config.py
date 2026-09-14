@@ -10,7 +10,6 @@ class Config(BaseModel):
     # LLM配置
     default_model: str = "deepseek-chat"
     # "没指定, 让框架自动检测"。必须写成 Optional[str]: None 是它的正常取值,
-    # 标成 str 只是注解写错了, 类型检查器会误报。
     default_provider: Optional[str] = None
     temperature: float = 0.7
     max_tokens: Optional[int] = None
@@ -18,10 +17,16 @@ class Config(BaseModel):
     # 系统配置
     debug: bool = False
     log_level: str = "INFO"
-    system_prompt: str = "你是一个全知全能的人类，无论是什么问题你都可以以极其专业的角度入手并且可以以小白也能够理解的方式解决"
+    system_prompt: str = "你是一个全知全能的造物主，无论是什么问题你都可以以极其专业的角度入手并且可以以小白也能够理解的方式解决"
     
     # 其他配置
-    max_history_length: int = 100
+    max_history_length: int = 100   # 消息条数上限
+    max_history_turns: int = 20     # 保留多少轮对话
+
+    # 总字符预算 —— 前两个预算数的是"有几条消息", 这个数的是"一共多大"。
+    max_history_chars: int = 40000
+    # 旧轮的工具结果被压缩后保留多少字符(要够模型认出"这里原本有个结果")
+    compacted_tool_chars: int = 400
 
 
     
@@ -38,5 +43,4 @@ class Config(BaseModel):
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         # model_dump() 是 pydantic v2 的写法; .dict() 在 v2 里已废弃,
-        # 2.10 调用会发 DeprecationWarning, 后续版本会被移除。
         return self.model_dump()

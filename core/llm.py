@@ -6,13 +6,28 @@ from typing import Literal, Optional, Iterator
 from openai import OpenAI
 
 from .exceptions import *
-from .types import LLMResponse, ToolCall, parse_tool_calls, safe_parse_arguments
+from .typedefs import LLMResponse, ToolCall, parse_tool_calls, safe_parse_arguments
 from .config import Config
 
 # 各模块自己 getLogger(__name__)
 logger = logging.getLogger(__name__)
 
-API_PROVIDERS = Literal["openai", "deepseek", "qwen", "vllm"]
+API_PROVIDERS = Literal[
+    "openai", "deepseek", "qwen", "modelscope", "kimi",
+    "zhipu", "ollama", "vllm", "local", "auto",
+]
+
+# provider -> 能证明它存在的环境变量。检测顺序 = 这个元组的顺序。
+_ENV_PROVIDER_KEYS = (
+    ("openai", ("OPENAI_API_KEY",)),
+    ("deepseek", ("DEEPSEEK_API_KEY",)),
+    ("qwen", ("DASHSCOPE_API_KEY",)),
+    ("modelscope", ("MODELSCOPE_API_KEY",)),
+    ("kimi", ("KIMI_API_KEY", "MOONSHOT_API_KEY")),
+    ("zhipu", ("ZHIPU_API_KEY", "GLM_API_KEY")),
+    ("ollama", ("OLLAMA_API_KEY", "OLLAMA_HOST")),
+    ("vllm", ("VLLM_API_KEY", "VLLM_HOST")),
+)
 
 class Agents0to1:
     """
@@ -78,40 +93,85 @@ class Agents0to1:
         self._client = self._create_client()
 
     """
-    以下4个私有函数 直接cv自hello agent 哈哈 懒了... 用于构建 API链接
+    以下4个私有函数 直接cv自hello agent 哈哈 .. 用于构建 API链接
     包括寻找provider
     根据provider查找key 与 url
     以上两步都没用 就用默认模型
     以及创建链接
     """
 
+    def _detect_from_base_url(self, base_url: Optional[str], api_key: Optional[str] = None) -> Optional[str]:
+        """按 base_url 认 provider。认不出来返回 None(调用方决定怎么兜底)。"""
+        base_url_lower = (base_url or "").lower()
+        if not base_url_lower:
+            return None
+
+        if "api.openai.com" in base_url_lower:
+            return "openai"
+        if "api.deepseek.com" in base_url_lower:
+            return "deepseek"
+        if "dashscope.aliyuncs.com" in base_url_lower:
+            return "qwen"
+        if "api-inference.modelscope.cn" in base_url_lower:
+            return "modelscope"
+        if "api.moonshot.cn" in base_url_lower:
+            return "kimi"
+        if "open.bigmodel.cn" in base_url_lower:
+            return "zhipu"
+
+        is_local = "localhost" in base_url_lower or "127.0.0.1" in base_url_lower
+        common_local_port = any(p in base_url_lower for p in (":8080", ":7860", ":5000"))
+        if is_local or common_local_port:
+            # 本地部署要再分一层: 11434 一定是 ollama, 8000+vllm 是 vLLM, 其余当通用本地服务
+            if ":11434" in base_url_lower or "ollama" in base_url_lower:
+                return "ollama"
+            if ":8000" in base_url_lower and "vllm" in base_url_lower:
+                return "vllm"
+            if api_key and api_key.lower() == "ollama":
+                return "ollama"
+            if api_key and api_key.lower() == "vllm":
+                return "vllm"
+            return "local"
+
+        return None
+
     def _auto_detect_provider(self, api_key: Optional[str], base_url: Optional[str]) -> str:
         """
         自动检测LLM提供商
 
         检测逻辑：
-        1. 优先检查特定提供商的环境变量
+        1. 检查特定提供商的环境变量; 命中多个时用 base_url 打破平局
         2. 根据API密钥格式判断
         3. 根据base_url判断
         4. 默认返回通用配置
+
+        【为什么第 1 步要处理"命中多个"】一台机器上同时存在 OPENAI_API_KEY 和
+        DEEPSEEK_API_KEY 是常态(全局 .env、多个项目共用)。按原来的写法, 谁在前面
+        谁赢, 于是"我明明配的是 deepseek"变成 openai —— 而且是静默的: 接着
+        _resolve_credentials 会挑默认 base_url、_get_default_model 会挑默认模型,
+        最后你可能拿着密钥去请求一个根本没开通过的服务。选错 provider 不报错,
+        只是把答案悄悄换掉, 这种偏差最难查。
         """
         # 1. 检查特定提供商的环境变量
-        if os.getenv("OPENAI_API_KEY"):
-            return "openai"
-        if os.getenv("DEEPSEEK_API_KEY"):
-            return "deepseek"
-        if os.getenv("DASHSCOPE_API_KEY"):
-            return "qwen"
-        if os.getenv("MODELSCOPE_API_KEY"):
-            return "modelscope"
-        if os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY"):
-            return "kimi"
-        if os.getenv("ZHIPU_API_KEY") or os.getenv("GLM_API_KEY"):
-            return "zhipu"
-        if os.getenv("OLLAMA_API_KEY") or os.getenv("OLLAMA_HOST"):
-            return "ollama"
-        if os.getenv("VLLM_API_KEY") or os.getenv("VLLM_HOST"):
-            return "vllm"
+        matched = [
+            provider
+            for provider, keys in _ENV_PROVIDER_KEYS
+            if any(os.getenv(k) for k in keys)
+        ]
+
+        if matched:
+            # base_url 是比"环境里恰好有这么个 key"强得多的意图信号, 用它打破平局
+            hinted = self._detect_from_base_url(base_url or os.getenv("LLM_BASE_URL"), api_key)
+            winner = hinted if hinted in matched else matched[0]
+            if len(matched) > 1:
+                logger.warning(
+                    "检测到多个 provider 的环境变量: %s。已选择 '%s'%s。"
+                    "若不对, 请显式传 provider=... 或清掉多余的环境变量 —— "
+                    "静默选错 provider 不会报错, 只会让请求打到另一个服务上。",
+                    "/".join(matched), winner,
+                    "(按 base_url 判断)" if winner == hinted else "(按检测顺序取第一个)",
+                )
+            return winner
 
         # 2. 根据API密钥格式判断
         actual_api_key = api_key or os.getenv("LLM_API_KEY")
@@ -133,40 +193,9 @@ class Agents0to1:
                 return "zhipu"
 
         # 3. 根据base_url判断
-        actual_base_url = base_url or os.getenv("LLM_BASE_URL")
-        if actual_base_url:
-            base_url_lower = actual_base_url.lower()
-            if "api.openai.com" in base_url_lower:
-                return "openai"
-            elif "api.deepseek.com" in base_url_lower:
-                return "deepseek"
-            elif "dashscope.aliyuncs.com" in base_url_lower:
-                return "qwen"
-            elif "api-inference.modelscope.cn" in base_url_lower:
-                return "modelscope"
-            elif "api.moonshot.cn" in base_url_lower:
-                return "kimi"
-            elif "open.bigmodel.cn" in base_url_lower:
-                return "zhipu"
-            elif "localhost" in base_url_lower or "127.0.0.1" in base_url_lower:
-                # 本地部署检测 - 优先检查特定服务
-                if ":11434" in base_url_lower or "ollama" in base_url_lower:
-                    return "ollama"
-                elif ":8000" in base_url_lower and "vllm" in base_url_lower:
-                    return "vllm"
-                elif ":8080" in base_url_lower or ":7860" in base_url_lower:
-                    return "local"
-                else:
-                    # 根据API密钥进一步判断
-                    if actual_api_key and actual_api_key.lower() == "ollama":
-                        return "ollama"
-                    elif actual_api_key and actual_api_key.lower() == "vllm":
-                        return "vllm"
-                    else:
-                        return "local"
-            elif any(port in base_url_lower for port in [":8080", ":7860", ":5000"]):
-                # 常见的本地部署端口
-                return "local"
+        detected = self._detect_from_base_url(base_url or os.getenv("LLM_BASE_URL"), actual_api_key)
+        if detected:
+            return detected
 
         # 4. 默认返回auto，使用通用配置
         return "auto"
@@ -278,10 +307,6 @@ class Agents0to1:
     def _build_request_params(self, messages: list[dict], tools=None, stream: bool = False, **kwargs) -> dict:
         """
         组装请求参数 —— invoke 和 stream_invoke 共用这一处, 保证两条路的参数规则一致。
-
-        实测: 把 tools=None / max_tokens=None 直接传给 create(),
-        请求体里就真的出现 "tools": null —— 部分 OpenAI 兼容服务(vLLM/网关)会因此返回 400。
-        所以"没有值"的参数要整个不放进字典, 而不是放一个 None 进去。
         """
         params: dict = {
             "model": self.model,
@@ -335,11 +360,6 @@ class Agents0to1:
     def stream_invoke(self, messages: list[dict[str, str]], tools = None, temperature: Optional[float] = None, **kwargs) -> Iterator[str]:
         """
         流式调用LLM。适用于长任务。
-
-        last_response 的语义:
-            流被【完整消费】 -> 写入本次的完整响应(含 tool_calls)
-            消费者提前 break  -> 停在 yield 处, 赋值语句永远不执行, 保持旧值
-        所以每次进来先把它清成 None: 清掉旧值, 调用方就不会拿到"上一轮的响应"
         """
         self.last_response = None
 
