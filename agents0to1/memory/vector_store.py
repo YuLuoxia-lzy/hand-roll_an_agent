@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 from array import array
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..core.exceptions import *
 from ..utils.logging import get_logger
@@ -73,16 +73,42 @@ def cosine_similarity(
     vector: Sequence[float],
     query_norm: Optional[float] = None,
     vector_norm: Optional[float] = None,
+    **ignored,
 ) -> float:
     """
     余弦相似度。模长允许外部传进来(见"预存模长")
     两个模长里只要有一个是 0(全零向量), 相似度就不再有定义 —— 返回 0.0
+
+    【**ignored 不是摆设】
+    它是默认 scorer, 而 search() 调 scorer 时会多传 created_at / metadata
+    (见下面的 Scorer 说明)。多出来的关键字在这里被丢掉, 于是"默认打分"和
+    "自定义打分"能被同一处代码调用 —— 否则就得写个 if scorer is None 的分支,
+    两条路的调用姿势还不一样。
     """
     qn = query_norm if query_norm is not None else _norm(query)
     vn = vector_norm if vector_norm is not None else _norm(vector)
     if qn == 0 or vn == 0:
         return 0.0
     return _dot(query, vector) / (qn * vn)
+
+
+#: 打分函数的签名。
+#:
+#: 默认是纯余弦 —— 这是**文档系统**的正确选择: 一份 2023 年的手册不该因为"旧"就沉下去。
+#: 小镇的记忆流要的是 recency + importance + relevance 三因子, 那是**另一套**公式。
+#: 两者冲突, 框架不该替应用选, 所以留这条缝:
+#:
+#:     def memory_stream_scorer(query, vector, *, query_norm, vector_norm,
+#:                              created_at, metadata, **kw):
+#:         relevance  = cosine_similarity(query, vector, query_norm, vector_norm)
+#:         recency    = 0.99 ** ((time.time() - created_at) / 3600)   # 指数衰减
+#:         importance = metadata.get("importance", 5) / 10            # LLM 打的分存这
+#:         return 1.0 * recency + 1.0 * importance + 1.5 * relevance
+#:
+#:     for score, text, meta in store.search(vec, scorer=memory_stream_scorer): ...
+#:
+#: 返回的分数**越大越靠前**(search 按 -score 排序)。
+Scorer = Callable[..., float]
 
 
 class VectorStore:
@@ -159,11 +185,44 @@ class VectorStore:
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.execute(self._SCHEMA.format(table=self.table))
             self._conn.commit()
+            self._has_json1 = self._probe_json1()
 
         logger.info(
-            "向量库就绪: path=%s table=%s storage=%s numpy=%s",
-            self.path, self.table, self.storage, _HAS_NUMPY,
+            "向量库就绪: path=%s table=%s storage=%s numpy=%s json1=%s",
+            self.path, self.table, self.storage, _HAS_NUMPY, self._has_json1,
         )
+
+    def _probe_json1(self) -> bool:
+        """
+        探一次 json1 扩展在不在。
+
+        filters(元数据过滤)和 delete(filters=...) 靠 json_extract 实现, 它需要
+        sqlite 的 json1 扩展。Python 3.10 自带的 sqlite 实测都有, 但**这不是保证**
+        —— 编译选项不同的发行版可能没有。所以探一次, 把结果记下来。
+
+        探到没有不会报错, 而是走**退化路径**(取回后在 Python 里筛), 并且每次退化都
+        留一条 warning —— 静默退化比报错更难查。在这里探而不是等用户第一次传
+        filters 时才崩在一条 sqlite 的 OperationalError 上, 也是同一个理由。
+        """
+        try:
+            self._conn.execute("SELECT json_extract('{\"a\":1}', '$.a')")
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    def _require_open(self) -> None:
+        """
+        关掉之后再用, 给一句人话。
+
+        不加这个的话报的是 `AttributeError: 'NoneType' object has no attribute
+        'execute'` —— 它既没说"这个库已经关了", 也没说是谁关的, 而且是**在**
+        with 块外面才炸(往往是几层调用之后), 找起来很费劲。
+        """
+        if self._conn is None:
+            raise VectorStoreException(
+                f"向量库已经关闭(path={self.path}, table={self.table}), 不能再用了。"
+                f"close() 之后连 count() 都不行 —— 想要继续用就重新建一个实例。"
+            )
 
     # ==================== 编码 / 解码 ====================
 
@@ -209,6 +268,7 @@ class VectorStore:
         Returns:
             新插入行的 id 列表
         """
+        self._require_open()
         texts = list(texts)
         vectors = [list(v) for v in vectors]
         metas = list(metadatas) if metadatas is not None else [None] * len(texts)
@@ -262,7 +322,13 @@ class VectorStore:
     def _assert_same_model(self, model: Optional[str], dim: Optional[int]) -> None:
         """
         跨模型 / 跨维度直接拒绝。
+
+        【表级校验, 它给的是一条更清楚的报错, 不是唯一的防线】
+        它只在"这个模型在库里**完全没出现过**"时拦下来。库里混进两个模型的向量时
+        (换 embedding provider 之后复用同一个库就会发生), 它**放行** —— 所以
+        search() 里还有一条行级的 `WHERE model = ?`, 两者缺一不可。见 2.4。
         """
+        self._require_open()
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT DISTINCT model FROM {self.table}"
@@ -290,16 +356,26 @@ class VectorStore:
         query_vector: Sequence[float],
         top_k: int = 5,
         model: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        scorer: Optional[Scorer] = None,
     ) -> List[Tuple[float, str, Dict[str, Any]]]:
         """
-        全表扫描算余弦, 返回最像的 top_k 条。
+        全表扫描算分, 返回最像的 top_k 条。
+
         Args:
             query_vector: 查询向量
             top_k:        返回条数
-            model:        查询向量的模型指纹, 用于跨模型校验
+            model:        查询向量的模型指纹。**行级过滤** —— 不只是校验, 见下
+            filters:      元数据等值过滤, 如 {"source": "手册.md"}。
+                          **在 SQL 层过滤**(和向量检索同一次扫描), 不是取回来再筛 ——
+                          top_k 是在全库上截断的, 先截断再筛可能一条不剩,
+                          而真正匹配的还躺在第 6 到第 50 名。
+            scorer:       打分函数, 默认纯余弦。见 Scorer 的说明
         Returns:
-            [(相似度, 文本, metadata), ...], 按相似度**从高到低**。
-            相似度在 [-1, 1]: 1 = 完全同向, 0 = 正交(无关), -1 = 反向。
+            [(分数, 文本, metadata), ...], 按分数**从高到低**(大者靠前)。
+            默认打分下分数在 [-1, 1]: 1 = 完全同向, 0 = 正交(无关), -1 = 反向。
+            换成自定义 scorer 之后分数就是它自己的量纲 —— **返回值永远是三元组**,
+            recency 之类的效果已经编码在分数里, 不额外往外传(零破坏)。
         """
         query = list(query_vector)
         if not query:
@@ -307,13 +383,40 @@ class VectorStore:
         if top_k <= 0:
             return []
 
+        # 表级校验: 模型在库里完全没出现过时, 给一句更清楚的报错
         self._assert_same_model(model, len(query))
         q_norm = _norm(query)
 
+        where_parts, params = [], []
+        if model is not None:
+            # ← 行级过滤, 和表级校验是**两回事**, 两个都要。
+            # 表级只在"这个模型在库里一条都没有"时拦下来; 库里混进两个模型的向量时
+            # (换 embedding provider 后复用同一个库就会发生) 它会**放行**,
+            # 于是旧模型的行也参与打分、还可能拿满分。不报错, 只给错结果。
+            where_parts.append("model = ?")
+            params.append(model)
+
+        # filters: 能用 SQL 就用 SQL, 不能就退化(见 _probe_json1)
+        use_sql_filters = bool(filters) and self._has_json1
+        if use_sql_filters:
+            where, filter_params = self._where_clause(filters)
+            where_parts.append(where.replace(" WHERE ", ""))
+            params.extend(filter_params)
+        elif filters:
+            logger.warning(
+                "本机 sqlite 没有 json1 扩展, filters 退化成『取回后在内存里筛』: %s。"
+                "结果可能比预期少 —— top_k 仍然是在全库上截断的。",
+                filters,
+            )
+
+        sql = f"SELECT id, text, metadata, norm, storage, vector, created_at FROM {self.table}"
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
+
         with self._lock:
-            rows = self._conn.execute(
-                f"SELECT text, metadata, norm, storage, vector FROM {self.table}"
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
+
+        score_fn = scorer or cosine_similarity
 
         scored: List[Tuple[float, str, Dict[str, Any]]] = []
         for row in rows:
@@ -322,25 +425,166 @@ class VectorStore:
                 logger.warning("跳过一条维度不符的记录(库里 %d 维, 查询 %d 维)", len(vector), len(query))
                 continue
 
-            score = cosine_similarity(query, vector, query_norm=q_norm, vector_norm=row["norm"])
             try:
                 meta = json.loads(row["metadata"])
             except (json.JSONDecodeError, TypeError):
                 meta = {}
+
+            if filters and not use_sql_filters and not self._match_filters(meta, filters):
+                continue
+
+            score = score_fn(
+                query, vector,
+                query_norm=q_norm,
+                vector_norm=row["norm"],
+                # 下面两个是给自定义 scorer 的额外信号(recency 要用 created_at,
+                # importance 之类走 metadata)。默认的 cosine_similarity 用 **ignored 丢掉它们。
+                created_at=row["created_at"],
+                metadata=meta,
+            )
             scored.append((score, row["text"], meta))
 
         scored.sort(key=lambda item: (-item[0], item[1]))
         return scored[:top_k]
 
+    # ==================== filters: 元数据过滤 ====================
+
+    @staticmethod
+    def _check_filter_keys(filters: Dict[str, Any]) -> None:
+        """
+        键必须白名单校验 —— 它是**拼进 SQL 字符串**的, 不是绑定参数。
+
+        虽然 key 落在 json_extract 的路径字面量里, 注入面比看起来小,
+        但"看起来安全"不是安全。
+
+        规则和报错信息说的一致: 只收 ASCII 字母数字下划线。
+        (⚠️ str.isalnum() 对中文也返回 True, 所以必须再加 isascii ——
+         光靠 isalnum 会把 '$.中文' 这种路径放进 SQL。)
+        """
+        for key in filters:
+            if not isinstance(key, str):
+                raise VectorStoreException(
+                    f"filters 的键必须是字符串, 收到 {type(key).__name__}。"
+                )
+            bare = key.replace("_", "")
+            if not (bare.isascii() and bare.isalnum()):
+                raise VectorStoreException(
+                    f"filters 的键只能是字母数字下划线, 收到 '{key}'。"
+                )
+
+    def _where_clause(self, filters: Optional[Dict[str, Any]]) -> Tuple[str, list]:
+        """
+        把 {k: v} 翻译成 SQL 的 WHERE 片段。**等值匹配**, 需要范围查询再加。
+
+        返回 (" WHERE a = ? AND b = ?", [值, 值]) —— 值走**参数绑定**, 不拼进 SQL。
+        """
+        if not filters:
+            return "", []
+
+        self._check_filter_keys(filters)
+
+        clauses, params = [], []
+        for key, value in filters.items():
+            clauses.append(f"json_extract(metadata, '$.{key}') = ?")
+            params.append(value)
+        return " WHERE " + " AND ".join(clauses), params
+
+    @staticmethod
+    def _match_filters(metadata: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+        """
+        json1 不可用时的退化路径: 取回之后在内存里筛。
+
+        语义刻意和 SQL 版对齐(等值), 包括"键不存在就算不匹配"这一条 ——
+        SQL 那边键不存在时 json_extract 给 NULL, `NULL = ?` 是 NULL(假),
+        所以这里也要求 k 必须**在** metadata 里, 而不是拿 .get() 的 None 去比。
+        """
+        return all(k in metadata and metadata[k] == v for k, v in filters.items())
+
+    # ==================== delete: 按条件删除 ====================
+
+    def delete(
+        self,
+        ids: Optional[Sequence[int]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """
+        按 id 或元数据条件删除, 返回删了几条。
+
+        【安全设计: 两个都不传就拒绝】
+        不带条件的 delete 和 clear() 长得一样, 但语义完全不同 ——
+        前者是"我确定要删这些", 后者是"我要清库"。
+        允许无参调用, 就等于给了一次"手滑清库"的机会。
+
+        【为什么需要它】
+        今天只有 clear()(全清)。想"只更新变了的那份文档"就只能全量重建,
+        连别的 source 一起清掉 —— 所以"增量入库"在原来的 API 上**做不到**。
+        """
+        self._require_open()
+        if ids is None and filters is None:
+            raise VectorStoreException(
+                "delete 必须给出 ids 或 filters 之一。"
+                "要清空整张表请显式调用 clear() —— 它会在日志里留一条 warning。"
+            )
+
+        if ids is not None:
+            ids = list(ids)
+
+        asked_filters = filters          # 只给日志用 —— 退化路径会把它折进 ids
+        if filters and not self._has_json1:
+            # 没有 json1 就没法在 SQL 里筛元数据 —— 退化成"先扫出 id, 再按 id 删"。
+            # 结果**是对的**(和 SQL 版等值语义一致), 只是多一次全表扫描。
+            logger.warning("本机 sqlite 没有 json1 扩展, delete(filters=...) 退化成先查 id 再删: %s", filters)
+            matched = set(self._scan_for_filters(filters))
+            ids = sorted(matched if ids is None else matched & set(ids))
+            filters = None
+
+        clauses, params = [], []
+        if ids:
+            clauses.append(f"id IN ({','.join('?' * len(ids))})")
+            params.extend(ids)
+        if filters:
+            where, filter_params = self._where_clause(filters)
+            # 这里的片段不带 " WHERE " 前缀, 因为要拼进 AND 串里
+            clauses.append(where.replace(" WHERE ", ""))
+            params.extend(filter_params)
+
+        if not clauses:
+            return 0
+
+        sql = f"DELETE FROM {self.table} WHERE " + " AND ".join(clauses)
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            self._conn.commit()
+        logger.info("向量库删除 %d 条 (ids=%s filters=%s)", cur.rowcount, ids, asked_filters)
+        return cur.rowcount
+
+    def _scan_for_filters(self, filters: Dict[str, Any]) -> List[int]:
+        """json1 不可用时的兜底: 全表取回, 在内存里按 filters 筛出匹配行的 id"""
+        self._check_filter_keys(filters)
+        with self._lock:
+            rows = self._conn.execute(f"SELECT id, metadata FROM {self.table}").fetchall()
+
+        matched = []
+        for row in rows:
+            try:
+                meta = json.loads(row["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+            if self._match_filters(meta, filters):
+                matched.append(row["id"])
+        return matched
+
     # ==================== 杂项 ====================
 
     def count(self) -> int:
         """库里有多少条"""
+        self._require_open()
         with self._lock:
             return self._conn.execute(f"SELECT COUNT(*) AS n FROM {self.table}").fetchone()["n"]
 
     def stats(self) -> Dict[str, Any]:
         """一眼看清库里存了什么 —— 排查"为什么搜不到"时先看它"""
+        self._require_open()
         with self._lock:
             row = self._conn.execute(
                 f"SELECT COUNT(*) AS n, COUNT(DISTINCT model) AS models, "
@@ -363,6 +607,7 @@ class VectorStore:
 
     def clear(self) -> int:
         """清空(表结构保留), 返回删掉多少条"""
+        self._require_open()
         with self._lock:
             n = self.count()
             self._conn.execute(f"DELETE FROM {self.table}")

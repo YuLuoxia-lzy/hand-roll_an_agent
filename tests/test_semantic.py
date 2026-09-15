@@ -244,13 +244,207 @@ def test_build_context_fails_open():
     mem.close()
 
 
-def test_fail_open_does_not_print_traceback():
-    """fail-open 用 warning 而不是 exception: 这在生产里会反复发生,
-    每次都打一整个堆栈会把日志刷爆"""
-    mem = _memory()
-    mem.embedder.fail = True
-    mem.build_context("随便问")
+def test_fail_open_logs_warning_not_traceback():
+    """
+    fail-open 用的必须是一条 warning, **不是整个堆栈** ——
+    这在生产里是会反复发生的事(embedding 独立 provider、独立 key、DeepSeek
+    压根没有 embedding 端点), 每次都打一整个堆栈会把日志刷爆。
+
+    【上一版这条是装样子的】它只调了一遍 build_context, 没有任何东西观察
+    logging —— 实现改成 logger.exception 打整个堆栈, 它照样绿。
+    所以这里挂一个 handler 上去, 真的把记录抓下来看。
+    """
+    import logging
+
+    from agents0to1.memory.vector_store import VectorStoreException   # noqa: F401  仅为断言用
+
+    records = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger = logging.getLogger("agents0to1.memory.semantic")
+    handler = Grab(level=logging.DEBUG)
+    old_level = logger.level
+    logger.addHandler(handler)
+    # 别让外部配置(LOG_LEVEL=ERROR)把这条用例弄红 —— 它测的是"打的是什么级别",
+    # 不是"当前环境开没开日志"
+    logger.setLevel(logging.DEBUG)
+    try:
+        mem = _memory()
+        mem.embedder.fail = True
+        assert mem.build_context("随便问") == ""
+        mem.close()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+    assert records, "fail-open 时应该留下一条日志, 否则出问题没人看得见"
+    assert all(r.levelno == logging.WARNING for r in records), (
+        f"fail-open 只该 warning, 收到: {[(r.levelname, r.getMessage()) for r in records]}"
+    )
+
+
+# ==================== 缝: store 可注入 / scorer / 遗忘 ====================
+
+class _FakeStore:
+    """
+    一个**自己实现**的向量库。
+
+    刻意不继承 VectorStore —— 那会把"换一个类"变成"换一个子类",
+    而接口承诺的是"有那几个方法就行"。
+    """
+
+    def __init__(self):
+        self.rows = []              # [{"text", "vector", "meta"}]
+        self.search_args = []
+
+    def add(self, texts, vectors, metadatas=None, model="unknown"):
+        metas = list(metadatas) if metadatas is not None else [{} for _ in texts]
+        start = len(self.rows)
+        for text, vector, meta in zip(texts, vectors, metas):
+            self.rows.append({"text": text, "vector": list(vector), "meta": dict(meta or {})})
+        return list(range(start, len(self.rows)))
+
+    def search(self, query_vector, top_k=5, model=None, filters=None, scorer=None):
+        self.search_args.append({"top_k": top_k, "model": model, "filters": filters})
+        out = []
+        for row in self.rows:
+            if filters and not all(row["meta"].get(k) == v for k, v in filters.items()):
+                continue
+            score = 1.0
+            if scorer:
+                score = scorer(query_vector, row["vector"], metadata=row["meta"],
+                               created_at=0.0, query_norm=None, vector_norm=None)
+            out.append((score, row["text"], row["meta"]))
+        out.sort(key=lambda item: -item[0])
+        return out[:top_k]
+
+    def count(self):
+        return len(self.rows)
+
+    def stats(self):
+        return {"count": len(self.rows)}
+
+    def clear(self):
+        n = len(self.rows)
+        self.rows = []
+        return n
+
+    def close(self):
+        self.closed = True
+
+
+def test_semantic_memory_accepts_a_custom_store():
+    """**"换 faiss / chroma 就是换一个类"这条承诺的兑现处。**
+
+    改造前 store 是写死的 VectorStore(...), 文档却一直声称可换 —— 换不了。
+    """
+    store = _FakeStore()
+    mem = SemanticMemory(embedder=FakeEmbedder(), store=store)
+
+    mem.remember("小明住在杭州西湖区。")
+    assert store.count() == 1, "入库必须走的是注入进来的那个 store"
+    assert mem.count() == 1
+
+    got = mem.search("小明住哪里", top_k=3)
+    assert [i.text for i in got] == ["小明住在杭州西湖区。"]
+
+    # 检索参数也要真的传到 store 上(尤其是 filters)
+    assert store.search_args[-1]["model"] == mem.embedder_id
     mem.close()
+    assert store.closed, "close() 要穿透到注入的 store"
+
+
+def test_custom_store_needs_the_full_contract():
+    """缺方法要在**构造时**就报错 —— 而不是等第一次检索才炸"""
+    class Half:
+        def add(self, *a, **k): ...
+        def search(self, *a, **k): ...
+
+    try:
+        SemanticMemory(embedder=FakeEmbedder(), store=Half())
+    except TypeError as e:
+        assert "count" in str(e)
+        return
+    raise AssertionError("store 缺 count/clear/close 应该在构造时就拒绝")
+
+
+def test_scorer_can_be_swapped_at_memory_level():
+    """小镇用法: **不继承、不改框架**, 传一个 scorer 就换掉了打分公式。
+
+    文档系统保持默认余弦(旧手册不该因为旧就沉下去), 小镇要三因子 ——
+    两者冲突, 所以框架把选择权交出来。
+    """
+    def by_rank(query, vector, *, metadata, **kw):
+        return float(metadata.get("rank", 0))
+
+    mem = _memory(scorer=by_rank)
+    mem.remember("甲", {"rank": 1})
+    mem.remember("乙", {"rank": 3})
+    mem.remember("丙", {"rank": 2})
+
+    got = [i.text for i in mem.search("任意查询", top_k=3)]
+    assert got == ["乙", "丙", "甲"], f"打分该由 scorer 决定(rank 3/2/1), 实际 {got}"
+
+    # 单次调用可以覆盖实例上的默认值
+    def reversed_rank(query, vector, *, metadata, **kw):
+        return -float(metadata.get("rank", 0))
+
+    # ⚠️ 必须显式放低 min_score: min_score 比的是 **scorer 的输出**,
+    # 默认 0.0 会把 -1/-2/-3 全部滤掉 —— 换打分公式就得跟着调阈值。
+    got = [i.text for i in mem.search("任意查询", top_k=3, scorer=reversed_rank, min_score=-10)]
+    assert got == ["甲", "丙", "乙"], f"单次调用的 scorer 该覆盖实例默认值, 实际 {got}"
+    mem.close()
+
+
+def test_filters_reach_the_store():
+    mem = _memory()
+    mem.remember("甲来源", {"source": "甲.md"})
+    mem.remember("乙来源", {"source": "乙.md"})
+
+    got = mem.search("来源", top_k=5, filters={"source": "乙.md"})
+    assert [i.text for i in got] == ["乙来源"]
+    mem.close()
+
+
+def test_forget_by_source():
+    """小镇做"遗忘"的入口"""
+    with TempDir() as d:
+        mem = SemanticMemory(embedder=FakeEmbedder(), path=str(Path(d) / "s.sqlite3"))
+        mem.remember("甲说的话", {"source": "甲.md"})
+        mem.remember("乙说的话", {"source": "乙.md"})
+        assert mem.count() == 2
+
+        assert mem.forget({"source": "甲.md"}) == 1
+        assert mem.count() == 1
+        assert [i.text for i in mem.search("说的话", top_k=5)] == ["乙说的话"]
+        mem.close()
+
+
+def test_reindex_file_replaces_instead_of_duplicating():
+    """**增量入库**: 没有 delete 就只能全量重建, 连别的来源一起清掉。"""
+    with TempDir() as d:
+        src = Path(d) / "手册.md"
+        src.write_text("第一版的内容。", encoding="utf-8")
+
+        mem = SemanticMemory(embedder=FakeEmbedder(), path=str(Path(d) / "s.sqlite3"))
+        mem.ingest_file(str(src))
+        first = mem.count()
+        assert first == 1
+
+        # 同一个文件再 ingest 一次 -> 重复入库。这就是那个坑, 也是 reindex 存在的理由
+        mem.ingest_file(str(src))
+        assert mem.count() == first * 2, "重复 ingest 会重复入库(所以更新文件要用 reindex_file)"
+
+        src.write_text("第二版的内容。", encoding="utf-8")
+        assert mem.reindex_file(str(src)) == first
+        assert mem.count() == first, "reindex 之后该只剩新的一版, 而不是两版叠加"
+
+        got = mem.search("内容", top_k=10)
+        assert len(got) == 1 and "第二版" in got[0].text
+        mem.close()
 
 
 # ==================== 杂项 ====================
@@ -265,10 +459,25 @@ def test_stats_and_clear():
     mem.close()
 
 
-def test_close_is_idempotent():
+def test_close_is_idempotent_and_then_fails_clearly():
+    """
+    关两次不该炸(幂等), 但关掉**之后**再用必须报一句人话。
+
+    报 `AttributeError: 'NoneType' object has no attribute 'execute'` 的话,
+    既没说"这个库已经关了", 也没说谁关的 —— 而且往往是在 with 块外面几层才炸。
+    """
+    from agents0to1.memory.vector_store import VectorStoreException
+
     mem = _memory()
     mem.close()
-    mem.close()
+    mem.close()                                   # 幂等
+
+    try:
+        mem.count()
+    except VectorStoreException as e:
+        assert "关闭" in str(e), f"报错信息里没说清是「已关闭」: {e}"
+        return
+    raise AssertionError("close() 之后 count() 必须报一句清楚的错, 而不是 AttributeError")
 
 
 if __name__ == "__main__":

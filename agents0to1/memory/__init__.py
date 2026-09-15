@@ -13,6 +13,7 @@
 from .embedding import EmbeddingClient
 from .vector_store import (
     VectorStore,
+    Scorer,
     cosine_similarity,
     has_numpy,
     DEFAULT_STORAGE,
@@ -33,6 +34,7 @@ __all__ = [
 
     # 向量库
     "VectorStore",
+    "Scorer",              # 换打分公式的那个缝(文档系统 vs 小镇)
     "cosine_similarity",
     "has_numpy",
     "STORAGE_BLOB",

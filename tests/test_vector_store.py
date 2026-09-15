@@ -8,6 +8,7 @@
 
 import sys
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -152,8 +153,258 @@ def test_same_model_still_works_after_other_model_added():
     store = VectorStore(":memory:")
     store.add(["a"], [[1, 0]], model="m1")
     store.add(["b"], [[0, 1]], model="m2")
-    assert len(store.search([1, 0], model="m1")) == 2      # 维度相同, m1 在库里 -> 放行
+    got = store.search([1, 0], model="m1")      # 维度相同, m1 在库里 -> 放行, 不抛
+    assert [t for _, t, _ in got] == ["a"]      # 但只该拿到 m1 自己的那条
     store.close()
+
+
+def test_mixed_model_rows_do_not_participate_in_scoring():
+    """**表级校验拦不住的那种混库。**
+
+    换 embedding provider 之后复用同一个库就会发生: 库里有 m1 和 m2 两种向量,
+    拿 m1 查询时表级校验会**放行**(m1 确实在库里)。如果 SELECT 不带行级过滤,
+    m2 的行也会一起参与打分 —— 而且可能拿到接近满分。
+
+    实测过的原症状(修复前):
+        库里模型: ['openai/text-embedding-3-small', 'dashscope/text-embedding-v3']
+           1.0000  乙: 牛顿定律      ← dashscope 自己的
+           1.0000  甲: 苹果是水果     ← openai 生成的, 却被打了满分
+
+    不报错, 只给错结果。
+    """
+    store = VectorStore(":memory:")
+    store.add(["甲: 苹果是水果"], [[1, 0]], model="openai/emb")
+    store.add(["乙: 牛顿定律"], [[1, 0]], model="dashscope/emb")   # 故意用同一个向量
+
+    got = store.search([1, 0], top_k=10, model="openai/emb")
+
+    texts = [t for _, t, _ in got]
+    assert texts == ["甲: 苹果是水果"], f"旧模型的向量不该参与打分, 却拿到了: {texts}"
+    # 分数也必须是"余弦"而不是"被别的行撑起来的"
+    assert got[0][0] > 0.99
+    store.close()
+
+
+# ==================== 三处缝: scorer / filters / delete ====================
+#
+# 这三条都是"文档声称可换、实际换不了"的缺口。共同点是: 改动只有几十行,
+# 但决定了应用层(文档系统 / 小镇)能不能自己选。
+
+def test_scorer_replaces_the_ranking():
+    """传进去的 scorer, 它的分数**就是**最终排序 —— 框架不掺一脚。
+
+    默认余弦对"文档系统"是对的; "小镇"要的是 recency + importance + relevance。
+    两者冲突, 所以框架不该替应用选。
+    """
+    store = VectorStore(":memory:")
+    store.add(
+        ["甲", "乙", "丙"],
+        [[1, 0], [1, 0], [1, 0]],                    # 向量故意全一样: 排序只可能来自 scorer
+        [{"rank": 3}, {"rank": 1}, {"rank": 2}],
+        model="m",
+    )
+
+    def by_rank(query, vector, *, metadata, **kw):
+        return float(metadata["rank"])
+
+    got = [t for _, t, _ in store.search([1, 0], top_k=3, model="m", scorer=by_rank)]
+    assert got == ["甲", "丙", "乙"], f"排序应该完全由 scorer 决定(rank 3/2/1), 实际 {got}"
+    store.close()
+
+
+def test_scorer_receives_created_at_and_metadata():
+    """recency 要用 created_at, importance 走 metadata —— 两个额外信号都得送到。
+
+    它们**不往外传**(返回值仍是三元组), 所以 scorer 是拿到它们的唯一途径。
+    """
+    seen = {}
+
+    def spy_scorer(query, vector, *, created_at, metadata, query_norm, vector_norm, **kw):
+        seen["created_at"] = created_at
+        seen["metadata"] = metadata
+        seen["norms"] = (query_norm, vector_norm)
+        return 1.0
+
+    store = VectorStore(":memory:")
+    before = time.time()
+    store.add(["x"], [[1, 0]], [{"importance": 7}], model="m")
+    store.search([1, 0], model="m", scorer=spy_scorer)
+
+    assert isinstance(seen["created_at"], float) and before <= seen["created_at"] <= time.time()
+    assert seen["metadata"] == {"importance": 7}
+    assert seen["norms"][0] is not None and seen["norms"][1] is not None
+    store.close()
+
+
+def test_default_scorer_tolerates_the_extra_signals():
+    """默认 scorer 和自定义 scorer 走的是同一处调用 —— 多传的信号它要能丢掉。
+
+    不这么做的话就得写 `if scorer is None` 两条分支, 两条路的调用姿势还不一样。
+    """
+    store = VectorStore(":memory:")
+    store.add(["x"], [[1, 0]], model="m")
+    got = store.search([1, 0], model="m", scorer=cosine_similarity)   # 显式传默认的
+    assert len(got) == 1 and got[0][0] > 0.99
+    store.close()
+
+
+def test_filters_apply_before_top_k_truncation():
+    """**过滤必须发生在 SQL 层。**
+
+    在 Python 里筛是**错的**: top_k 是在全库上先截断的, 筛完之后可能一条不剩,
+    而真正匹配的还躺在第 6 到第 50 名。这条测试构造的正是那个场景 ——
+    top_k=1 时, 不过滤拿到的是别的来源, 过滤之后才拿到自己那一条。
+    """
+    store = VectorStore(":memory:")
+    store.add(
+        ["最像的(别的来源)", "次像的(本来源)", "不像的(本来源)"],
+        [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]],
+        [{"source": "other"}, {"source": "target"}, {"source": "target"}],
+        model="m",
+    )
+
+    assert [t for _, t, _ in store.search([1.0, 0.0], top_k=1, model="m")] == ["最像的(别的来源)"]
+
+    got = [t for _, t, _ in store.search([1.0, 0.0], top_k=1, model="m", filters={"source": "target"})]
+    assert got == ["次像的(本来源)"], f"过滤器要在 SQL 层生效, 实际 {got}"
+    store.close()
+
+
+def test_filters_missing_key_matches_nothing():
+    """库里没有这个键 -> 一条都不匹配(和 SQL 的 NULL = ? 语义对齐)"""
+    store = VectorStore(":memory:")
+    store.add(["x"], [[1, 0]], [{"source": "a"}], model="m")
+    assert store.search([1, 0], model="m", filters={"nope": "a"}) == []
+    assert store.search([1, 0], model="m", filters={"source": "b"}) == []
+    store.close()
+
+
+def test_filter_key_must_be_whitelisted():
+    """键是**拼进 SQL 字符串**的, 不是绑定参数 —— 不能靠"看起来安全"。"""
+    store = VectorStore(":memory:")
+    for bad in ("a'; DROP TABLE vectors; --", "中文键", "a b", ""):
+        try:
+            store.search([1, 0], model="m", filters={bad: 1})
+        except VectorStoreException as e:
+            assert "字母数字下划线" in str(e)
+            continue
+        store.close()
+        raise AssertionError(f"键 {bad!r} 应该被白名单拦下来")
+    store.close()
+
+
+def test_filters_still_work_without_json1():
+    """json1 不可用时的退化路径: 取回后在内存里筛, **结果必须和 SQL 版一致**。
+
+    本机的 sqlite 都有 json1, 所以这里手动把开关掰掉来验退化路径 ——
+    它是文档明确要求存在的兜底, 不验就等于没有。
+    """
+    store = VectorStore(":memory:")
+    store.add(
+        ["甲", "乙"],
+        [[1.0, 0.0], [0.0, 1.0]],
+        [{"source": "a"}, {"source": "b"}],
+        model="m",
+    )
+    store._has_json1 = False                      # 假装这台机器的 sqlite 没有 json1
+
+    got = [t for _, t, _ in store.search([1.0, 0.0], top_k=5, model="m", filters={"source": "a"})]
+    assert got == ["甲"], f"退化路径的结果该和 SQL 版一样, 实际 {got}"
+    store.close()
+
+
+def test_delete_by_ids():
+    store = VectorStore(":memory:")
+    ids = store.add(["甲", "乙", "丙"], [[1, 0], [0, 1], [1, 1]], model="m")
+
+    assert store.delete(ids=[ids[1]]) == 1
+    assert store.count() == 2
+    assert [t for _, t, _ in store.search([0, 1], top_k=5, model="m")] == ["丙", "甲"]
+    store.close()
+
+
+def test_delete_by_filters():
+    """**没有它就做不了"增量入库"** —— 只能全量重建, 连别的来源一起清掉。"""
+    store = VectorStore(":memory:")
+    store.add(
+        ["甲-1", "甲-2", "乙-1"],
+        [[1, 0], [0.9, 0.1], [0, 1]],
+        [{"source": "甲.md"}, {"source": "甲.md"}, {"source": "乙.md"}],
+        model="m",
+    )
+
+    assert store.delete(filters={"source": "甲.md"}) == 2
+    assert store.count() == 1
+    assert [t for _, t, _ in store.search([0, 1], top_k=5, model="m")] == ["乙-1"]   # 乙没被牵连
+    store.close()
+
+
+def test_delete_ids_and_filters_are_intersected():
+    """两个都给 = 交集, 不是并集"""
+    store = VectorStore(":memory:")
+    ids = store.add(
+        ["甲", "乙", "丙"],
+        [[1, 0], [0, 1], [1, 1]],
+        [{"source": "x"}, {"source": "x"}, {"source": "y"}],
+        model="m",
+    )
+    assert store.delete(ids=[ids[0], ids[2]], filters={"source": "x"}) == 1   # 只有甲同时满足
+    assert store.count() == 2
+    store.close()
+
+
+def test_delete_by_filters_still_works_without_json1():
+    """json1 不可用时的退化路径: 先扫出 id 再删。**结果必须和 SQL 版一致。**"""
+    store = VectorStore(":memory:")
+    ids = store.add(
+        ["甲", "乙", "丙"],
+        [[1, 0], [0, 1], [1, 1]],
+        [{"source": "x"}, {"source": "x"}, {"source": "y"}],
+        model="m",
+    )
+    store._has_json1 = False                      # 假装这台机器的 sqlite 没有 json1
+
+    # 和 ids 一起给的时候仍然是**交集**
+    assert store.delete(ids=[ids[0], ids[2]], filters={"source": "x"}) == 1
+    assert store.count() == 2
+    assert store.delete(filters={"source": "x"}) == 1
+    assert store.count() == 1
+    store.close()
+
+
+def test_delete_without_args_raises():
+    """无参 delete 和 clear() 只差一个"手滑"的距离 —— 必须拒绝"""
+    store = VectorStore(":memory:")
+    store.add(["甲"], [[1, 0]], model="m")
+    try:
+        store.delete()
+    except VectorStoreException as e:
+        assert "clear()" in str(e), "报错要顺手告诉用户清库该调哪个方法"
+        assert store.count() == 1, "拒绝之后一条都不许少"
+        store.close()
+        return
+    store.close()
+    raise AssertionError("无参 delete 必须拒绝, 否则它就是第二个 clear()")
+
+
+def test_delete_empty_ids_is_noop():
+    """空 ids 是"没有要删的", 不是"删全部" —— 这个区别值一条测试"""
+    store = VectorStore(":memory:")
+    store.add(["甲"], [[1, 0]], model="m")
+    assert store.delete(ids=[]) == 0
+    assert store.count() == 1
+    store.close()
+
+
+def test_delete_after_close_raises_clearly():
+    store = VectorStore(":memory:")
+    store.close()
+    try:
+        store.delete(ids=[1])
+    except VectorStoreException as e:
+        assert "已经关闭" in str(e)
+        return
+    raise AssertionError("关掉之后再用应该给一句人话, 而不是 NoneType 的 AttributeError")
 
 
 # ==================== 两种存储格式 ====================

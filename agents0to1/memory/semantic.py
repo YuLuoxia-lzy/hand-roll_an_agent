@@ -193,7 +193,7 @@ class SemanticMemory:
         for item in mem.search("用户住哪"):
             print(item.score, item.text)
 
-        agent = SimpleAgent("a", llm, memory=mem)    # 接进 Agent 循环见第五步
+        agent = SimpleAgent("a", llm, hooks=[MemoryHook(mem)])   # 见 agents0to1/hooks/memory.py
     """
 
     DEFAULT_CONTEXT_BUDGET = 2000
@@ -210,6 +210,8 @@ class SemanticMemory:
         context_budget: int = DEFAULT_CONTEXT_BUDGET,
         storage: Optional[str] = None,
         embedder_id: Optional[str] = None,
+        scorer: Optional[Any] = None,
+        store: Optional[Any] = None,
     ):
         """
         Args:
@@ -221,15 +223,41 @@ class SemanticMemory:
             min_score:      相似度下限。低于它的结果不喂给模型 —— 那只会干扰它
             context_budget: 检索结果拼成上下文时的字符上限
             embedder_id:    写进库的"模型指纹", 默认取 embedder.model_id
+            scorer:         打分函数, 默认纯余弦。见 VectorStore.Scorer ——
+                            **这是"文档系统"和"小镇"分道扬镳的那个开关**:
+                            文档系统保持默认(旧手册不该因为旧就沉下去),
+                            小镇传三因子的 memory_stream_scorer。
+            store:          自己实现的向量库。不传就自建 VectorStore。
+                            这是"换 faiss / chroma 就是换一个类"那条承诺的兑现处 ——
+                            以前它是**写死的**, 文档却一直声称可换。
         """
         self.embedder = embedder or EmbeddingClient()
-        self.store = VectorStore(path=path, table=table, storage=storage)
+
+        if store is not None:
+            # 鸭子类型守卫 —— 不要求它继承 VectorStore(那会把"换一个类"变成
+            # "换一个子类"), 只要求它有这几个方法。在**构造时**就报错, 比等到
+            # 第一次检索时才炸好得多(那时候报错位置离病因十万八千里)。
+            #
+            # 【search() 的签名也要对得上】本类调它时固定带这几个关键字:
+            #     store.search(向量, top_k=..., model=..., filters=..., scorer=...)
+            # 后两个值可能是 None。守卫只查方法在不在(那是构造期能查的全部),
+            # 签名不匹配会在第一次检索时以 TypeError 暴露。自定义 store 照着
+            # VectorStore.search 的参数表写就不会错。
+            for method in ("add", "search", "count", "clear", "close"):
+                if not callable(getattr(store, method, None)):
+                    raise TypeError(
+                        f"store 需要提供 {method}() 方法, 收到的是 {type(store).__name__}"
+                    )
+            self.store = store
+        else:
+            self.store = VectorStore(path=path, table=table, storage=storage)
 
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.top_k = top_k
         self.min_score = min_score
         self.context_budget = context_budget
+        self.scorer = scorer
 
         self.embedder_id = embedder_id or getattr(self.embedder, "model_id", None) or "unknown"
 
@@ -301,6 +329,39 @@ class SemanticMemory:
         logger.info("已入库 %d 块 (来自 %d 段文本)", len(all_chunks), len(texts))
         return len(all_chunks)
 
+    # ==================== 遗忘 / 增量入库 ====================
+    #
+    # 【为什么这两个是**框架**的事, 不是应用的事】
+    # 在原来的 API 上, 应用**做不到**这两件事 —— 不是"麻烦", 是"不可能":
+    # 只有 clear()(全清), 于是"只更新变了的那份文档"只能全量重建,
+    # 连别的 source 一起清掉。所以缝必须开在存储层(delete), 出口开在这里。
+
+    def forget(self, filters: Dict[str, Any]) -> int:
+        """
+        按来源/标签忘掉一批, 返回删了几块。
+
+        **这是"小镇"做遗忘的入口** —— 那边要的不是"删文件", 是"这条记忆淡出"。
+
+        ⚠️ 只接受 filters, 不提供无参调用 —— 那和 clear() 只差一个手滑的距离。
+        真要清库请显式调 clear()。
+        """
+        return self.store.delete(filters=filters)
+
+    def reindex_file(self, path: str, metadata: Optional[dict] = None) -> int:
+        """
+        重新入库一个文件: **先按 source 删掉旧的, 再灌新的**。
+
+        这才是"增量入库"。没有 delete 就做不了它 —— 每次改动都得全量重建,
+        而全量重建会把库里的其他来源一起清掉。
+
+        ⚠️ 同一份文件重复 ingest_file() 会**重复入库**(见 episodic.py 里同款的坑):
+        chunks 是按 source+chunk_index 记的, 但没有任何去重, 检索时同一段内容
+        会出现 N 次。要更新一个文件就调这个, 不要重复调 ingest_file()。
+        """
+        source = os.path.basename(str(path))
+        self.forget({"source": source})
+        return self.ingest_file(path, metadata)
+
     # ==================== 检索 ====================
 
     def search(
@@ -308,6 +369,8 @@ class SemanticMemory:
         query: str,
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        scorer: Optional[Any] = None,
     ) -> List[MemoryItem]:
         """
         检索。**这个方法是会抛异常的**(embedding 挂了就抛) ——
@@ -315,9 +378,14 @@ class SemanticMemory:
         Args:
             query:     查询文本
             top_k:     返回条数, 默认用 self.top_k
-            min_score: 相似度下限, 默认用 self.min_score
+            min_score: 分数下限, 默认用 self.min_score。
+                       ⚠️ 比的是 **scorer 的输出** —— 默认余弦下是 [-1,1],
+                       换成三因子 scorer 之后量纲就变了, 阈值要跟着调。
+            filters:   元数据等值过滤(如 {"source": "手册.md"}), **在 SQL 层生效**,
+                       不是取回来再筛 —— 后者在 top_k 已截断的前提下是错的
+            scorer:    这一次调用的打分函数, 默认用 self.scorer
         Returns:
-            MemoryItem 列表(含 score 和 metadata), 按相似度从高到低。空查询返回 []。
+            MemoryItem 列表(含 score 和 metadata), 按分数从高到低。空查询返回 []。
         """
         if not query or not query.strip():
             return []
@@ -326,7 +394,14 @@ class SemanticMemory:
         threshold = self.min_score if min_score is None else min_score
 
         vector = self.embedder.embed_one(query)
-        rows = self.store.search(vector, top_k=max(limit * 3, limit), model=self.embedder_id)
+        # 多取几倍再按阈值裁 —— 阈值可能砍掉一大半, 只取 limit 条会不够填
+        rows = self.store.search(
+            vector,
+            top_k=max(limit * 3, limit),
+            model=self.embedder_id,
+            filters=filters,
+            scorer=scorer or self.scorer,
+        )
 
         items = [
             MemoryItem(text=text, score=score, metadata=meta)
@@ -430,8 +505,10 @@ class SemanticMemory:
         self.close()
 
     def __repr__(self) -> str:
+        # path/table 用 getattr 兜底 —— store 可以是注入进来的实现, 它不一定有这两个属性
         return (
-            f"SemanticMemory(path={self.store.path}, table={self.store.table}, "
+            f"SemanticMemory(path={getattr(self.store, 'path', '?')}, "
+            f"table={getattr(self.store, 'table', '?')}, "
             f"embedder={self.embedder_id}, count={len(self)})"
         )
 
