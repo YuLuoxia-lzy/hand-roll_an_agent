@@ -613,6 +613,6 @@ class SemanticMemory:
 #
 # 假 embedder 把文本按字符哈希成固定长度的向量, 于是:
 #     相同文本 -> 相同向量      不同文本 -> 不同向量
-# 完全不花钱、不联网。完整版见 tests/test_semantic.py:
+# 完全不花钱、不联网。完整版见本地 tests/test_semantic.py:
 #     python tests/test_semantic.py
 

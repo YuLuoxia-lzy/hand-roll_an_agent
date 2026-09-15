@@ -18,6 +18,13 @@ dist/
 .venv/
 venv/
 
+# 学习笔记与离线测试 —— 只留在本地, 不往仓库推
+tests/
+docs/
+
+# 这个示例要用 tests/_harness.py 里的假 embedder / 假 LLM, 跟着 tests 一起留在本地
+examples/memory_demo.py
+
 # 工具
 .vscode/
 .idea/

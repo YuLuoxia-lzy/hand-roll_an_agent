@@ -644,7 +644,7 @@ class VectorStore:
 # 构造几个已知向量, 手算余弦, 对比:
 #     正交向量 -> 0      同向向量 -> 1      反向向量 -> -1
 #
-# 完整的版本见 tests/test_vector_store.py, 直接跑:
+# 完整的版本见本地 tests/test_vector_store.py, 直接跑:
 #     python tests/test_vector_store.py
 
 
