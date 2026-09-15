@@ -52,7 +52,8 @@ class ReActAgent(Agent):
         config: Optional[Config] = None,
         max_steps: int = 5,
         custom_prompt: Optional[str] = None,
-        memory: Optional[object] = None
+        hooks: Optional[list] = None,
+        agent_id: Optional[str] = None,
     ):
         """
         初始化ReActAgent
@@ -65,17 +66,19 @@ class ReActAgent(Agent):
             config: 配置对象
             max_steps: 最大执行步数(循环上限, 防止模型反复调工具停不下来)
             custom_prompt: 自定义工作方式说明(覆盖 DEFAULT_REACT_PROMPT)
-            memory: 记忆对象(SemanticMemory / EpisodicMemory 等)。
-                    它注入到最后那条 user 消息里, **不进 Turn** ——
-                    所以历史、快照、下一轮请求都不会带上检索结果。
+            hooks: 扩展点。记忆现在是 hooks=[MemoryHook(mem)] —— 它注入进
+                   **这一次发出去的请求**, 不进 Turn, 所以历史、快照、下一轮
+                   请求都不会带上检索结果(这个性质没变, 变的是它由谁保证:
+                   以前靠 _finish 手写还原, 现在靠 hook 返回新列表)。
+            agent_id: 身份, 不传就自动生成一个。
         """
-        super().__init__(name, llm, system_prompt, config, memory=memory)
+        super().__init__(name, llm, system_prompt, config, hooks=hooks, agent_id=agent_id)
         self.tool_registry = tool_registry
         self.max_steps = max_steps
         self.prompt_template = custom_prompt if custom_prompt else DEFAULT_REACT_PROMPT
 
-        # 最近一次运行的完整对话, 便于调试时回看"模型当时看到了什么"
-        self.last_messages: List[dict] = []
+        # last_messages 现在由基类维护(在 _chat / _stream_chat 出口处存"真正发出去的
+        # 那一份"), 这里不再自己定义 —— 否则就是两处各写一份、迟早走岔的经典现场。
 
     def _snapshot_state(self) -> dict:
         """
@@ -98,7 +101,7 @@ class ReActAgent(Agent):
 
     # ==================== 主循环 ====================
 
-    def run(self, input_text: str, **kwargs) -> str:
+    def _run(self, input_text: str, **kwargs) -> str:
         """
         运行ReAct Agent
 
@@ -111,12 +114,16 @@ class ReActAgent(Agent):
 
         """
         answer = ""
-        for event in self.stream_run(input_text, **kwargs):
+        # ⚠️ 调的是 _stream_run(), **不是 stream_run()**。
+        # stream_run() 是模板方法, 它会把当前 ctx 覆盖成新的一轮 ——
+        # 于是 after_run 拿到的上下文、记忆检索用的 input_text 全都对不上,
+        # 而且 ctx 被覆盖两次、清理只清一次。_stream_run 才是"用现在这个 ctx 接着跑"。
+        for event in self._stream_run(input_text, **kwargs):
             if event.type == "final":
                 answer = event.answer or ""
         return answer
 
-    def stream_run(self, input_text: str, **kwargs) -> Iterator[AgentEvent]:
+    def _stream_run(self, input_text: str, **kwargs) -> Iterator[AgentEvent]:
         """
         流式运行ReAct Agent, 边跑边吐事件。
 
@@ -133,14 +140,38 @@ class ReActAgent(Agent):
         turn_start = len(messages) - 1
 
         for _step in range(1, self.max_steps + 1):
+            # ==================== 先攒着, 流完了再定性 ====================
+            #
+            # 【为什么不能边收边吐 text】
+            # 这一轮的内容到底是"最终答案"还是"工具调用前的过程叙述", 要到**流结束**
+            # 才知道 —— 判据是 response.has_tool_calls, 而它只在整个流被消费完之后
+            # 才存在(见 core/agent.py:_stream_chat 末尾才写 self._last_response;
+            # llm.stream_invoke 同理, tool_calls 是在最后一个块里才拼齐的)。
+            #
+            # 边收边吐 text 的后果是: 等发现这轮其实要调工具, 那段"我先搜一下…"
+            # 已经作为 text 吐出去了 —— 于是同一段内容**既出现在 text 里又出现在
+            # thinking 里**。把 text 拼起来当答案的消费方就中招了: 最终答案里混进
+            # 一句过程叙述。这正是 core/typedefs.py 里那条警告说的病。
+            #
+            # 【代价, 写在明处】
+            # 正文不再"逐 token 实时"到达, 而是等这一轮流完之后才开始吐。这是把
+            # text 和 thinking 分对**必须**付的钱 —— 两者在流结束前根本无法区分,
+            # 没有"既实时又分对"的选项。
+            # 但事件的**形状**一点没变: 下面仍然按收到的原块边界逐个吐出去, 消费方
+            # 的拼接 / 逐块渲染逻辑一个字都不用改, 变的只是时间点。
+            chunks: List[str] = []
             for chunk in self._stream_chat(messages, tools=tools, **kwargs):
-                yield AgentEvent(type="text", text=chunk)
+                chunks.append(chunk)
 
             # 2. 流被完整消费后, 基类把完整响应放在 _last_response 上(含 tool_calls)
             response = self._last_response
             if response is None:
                 # 正常跑完上面的 for 一定会有值。真为 None 说明服务端一个块都没发,
                 logger.warning("流式响应为空, 提前结束本轮。")
+                # 已经收到的块照吐 —— 改造前它们本来就是边收边吐出去的, 攒着之后
+                # 更不能让它们凭空消失(那才是真的"丢字")
+                for chunk in chunks:
+                    yield AgentEvent(type="text", text=chunk)
                 self._append_assistant_message(messages, "")
                 self._finish(input_text, "", messages, turn_start)
                 yield AgentEvent(type="final", answer="")
@@ -150,6 +181,8 @@ class ReActAgent(Agent):
 
             # 3. 模型不再请求工具 -> 这就是最终答案, 循环结束
             if not response.has_tool_calls:
+                for chunk in chunks:
+                    yield AgentEvent(type="text", text=chunk)
                 self._append_assistant_message(messages, text)
                 self._finish(input_text, text, messages, turn_start)
                 yield AgentEvent(type="final", answer=text)
@@ -157,6 +190,9 @@ class ReActAgent(Agent):
 
             # 4. 模型请求了工具 -> 它这轮说的正文是**过程叙述**, 不是最终答案。
             #    先吐 thinking, 再吐工具事件 —— 和模型"先想后做"的顺序一致。
+            #
+            #    整段吐一次, 不是逐块: typedefs.py 里 thinking 的定义就是"整段"。
+            #    攒下来的 chunks 到这里**整个不用**(否则就是上面说的那种重复)。
             if text:
                 yield AgentEvent(type="thinking", text=text)
 
@@ -214,14 +250,22 @@ class ReActAgent(Agent):
     def _execute_tool_calls(self, messages: List[dict], calls: List[ToolCall]) -> List[tuple]:
         """
         执行这一轮的每个工具调用, 各自作为一条 tool 消息回传。
-        返回 [(call, result), ...], 顺序与 calls 严格一致 —— stream_run 靠它吐 tool_result 事件。
+        返回 [(call, result), ...], 顺序与 calls 严格一致 —— _stream_run 靠它吐 tool_result 事件。
+
+        【after_tool 挂在 append **之前**, 这是唯一说得通的位置】
+        tool 消息一旦 append, 它就是下一轮模型看到的东西; 事件也已经 yield 出去了。
+        想改结果就只能在这儿改 —— 拿返回值去 append, "hook 改过的"和"模型看到的"
+        才是同一份。挂在 append 之后就只是"记录", 不是"拦截"。
         """
+        ctx = self._hook_ctx()
+
         # registry.execute 失败时不抛异常, 返回"错误: xxx"字符串 ——
         # 这条错误会原样回传给模型, 模型看了能自己调整参数重试
         results = execute_many_sync(self.tool_registry, calls)
 
         pairs = []
         for call, result in zip(calls, results):
+            result = self._hooks.after_tool(ctx, call, result)
             logger.info("工具 %s(%s) -> %s", call.name, call.arguments, result)
             messages.append({
                 "role": "tool",
@@ -235,19 +279,16 @@ class ReActAgent(Agent):
         """
         收尾: 记录轨迹与对话历史, 返回答案。
 
-        【记之前必须把第一条还原成原始输入】
-        messages[turn_start] 就是 _build_messages 产出的那条 user 消息 —— 有记忆时
-        它带着本轮的检索结果(core/agent.py:_prepare_user_message)。检索结果只该活
-        在这一轮的请求里, 存进 Turn 的话下一轮会被当成"用户说过的话"重发, 而
-        _turn_chars 的预算也会被它白吃。见 _record_first_message()。
+        【这里原来有个补丁, 现在不需要了】
+        改造前 messages[turn_start] 带着本轮的检索结果(记忆注入发生在基类的
+        _build_messages 里), 所以存 Turn 之前必须**再手工还原成原始输入** ——
+        否则检索结果会被当成"用户说过的话"在下一轮重发, _turn_chars 的预算
+        也被它白吃。补丁本身没错, 错的是"注入发生在工作列表里"这件事。
+
+        现在注入由 hook 在 before_llm 阶段做, 而且**返回新列表**:
+        messages 从头到尾都是干净的那一份, 没有要还原的东西。
         """
-        self.last_messages = messages
-
-        recorded = list(messages[turn_start:])
-        if recorded and recorded[0].get("role") == "user":
-            recorded[0] = self._record_first_message(input_text)
-
-        self._record_turn(input_text, final_answer, messages=recorded)
+        self._record_turn(input_text, final_answer, messages=messages[turn_start:])
         return final_answer
 
 

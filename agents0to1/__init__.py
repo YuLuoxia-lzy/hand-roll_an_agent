@@ -62,6 +62,11 @@ from .tools import __all__ as _tools_all
 from .memory import *
 from .memory import __all__ as _memory_all
 
+# 现成的 hook 实现 —— 记忆注入(原来长在基类里)现在就是这里的一个 hook。
+# core/hooks.py 定规则(哪里能挂), 这里放"挂上去的现成东西", 应用自己写的放应用里。
+from .hooks import *
+from .hooks import __all__ as _hooks_all
+
 from .utils.logging import setup_logger
 
 
@@ -99,9 +104,10 @@ __all__ = [
     # 日志开关
     "enable_logging",
 
-    # 核心 / Agent / 工具 / 记忆, 由各子包的 __all__ 汇总而来
+    # 核心 / Agent / 工具 / 记忆 / 现成 hook, 由各子包的 __all__ 汇总而来
     *_core_all,
     *_classic_all,
     *_tools_all,
     *_memory_all,
+    *_hooks_all,
 ]

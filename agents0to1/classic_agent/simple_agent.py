@@ -16,13 +16,15 @@ class SimpleAgent(Agent):
         llm: Agents0to1,
         system_prompt: Optional[str] = None,
         config: Optional[Config] = None,
-        memory: Optional[object] = None
+        hooks: Optional[list] = None,
+        agent_id: Optional[str] = None,
     ):
         #运行目标函数的init的具体方法 可以自己补充
-        # memory 只能**关键字**传进基类: 前面四个是位置参数, 顺序不能动(见 core/agent.py 的说明)
-        super().__init__(name, llm, system_prompt, config, memory=memory)
+        # 前四个是位置参数, 顺序不能动; hooks / agent_id 只能**关键字**传进基类
+        # (见 core/agent.py 里"凭什么参数放在 config 后面"那段)
+        super().__init__(name, llm, system_prompt, config, hooks=hooks, agent_id=agent_id)
 
-    def run(self, input_text: str, **kwargs) -> str:
+    def _run(self, input_text: str, **kwargs) -> str:
         """
         运行简单Agent
         Args:
@@ -40,7 +42,7 @@ class SimpleAgent(Agent):
         return response.content or ""
 
 
-    def stream_run(self, input_text: str, **kwargs) -> Iterator[AgentEvent]:
+    def _stream_run(self, input_text: str, **kwargs) -> Iterator[AgentEvent]:
         """
         流式运行Agent
 

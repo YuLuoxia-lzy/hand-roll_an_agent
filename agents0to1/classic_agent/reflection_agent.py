@@ -97,14 +97,15 @@ class ReflectionAgent(Agent):
         config: Optional[Config] = None,
         max_iterations: int = 3,
         custom_prompt: Optional[Dict[str, str]] = None,
-        memory: Optional[object] = None
+        hooks: Optional[list] = None,
+        agent_id: Optional[str] = None,
     ):
-        super().__init__(name, llm, system_prompt, config, memory=memory)
+        super().__init__(name, llm, system_prompt, config, hooks=hooks, agent_id=agent_id)
         self.max_iterations = max_iterations
         self.scratch = Scratchpad()
         self.custom_prompt = custom_prompt if custom_prompt else DEFAULT_PROMPTS
 
-    def run(self, input_text: str, **kwargs) -> str:
+    def _run(self, input_text: str, **kwargs) -> str:
         """
         运行Reflection Agent
 
@@ -117,19 +118,21 @@ class ReflectionAgent(Agent):
         """
         self.scratch = Scratchpad() #本轮草稿轨迹, 每次 run 重来
 
-        # 【记忆只喂给**初稿**, 不喂给评审和改写】
-        # 为什么: 这个 Agent 的 messages[-1] 是"模型自己的草稿/评审意见",
-        # 不是用户问题。拿它去检索, 检索出来的东西和被检索的内容毫无关系。
-        # 而且只喂初稿还有第二层理由 —— 后面几轮喂了也没用:
-        # 检索结果会混进评审意见里, 变成"记忆在评自己", 越评越偏。
+        # 【记忆只喂给**初稿**, 不喂给评审和改写】—— 这条策略没变, 变的是谁来执行
         #
-        # 这个 Agent 不走 _build_messages(它直接用 _chat), 所以基类的钩子
-        # 对它不生效 —— 必须在 run() 里显式算一次。
-        context = self._memory_context(input_text)
-
+        # 为什么只喂初稿: 后面几次调用的最后一条消息是"模型自己的草稿/评审意见",
+        # 不是用户问题。拿它去检索, 检索出来的东西和被检索的内容毫无关系;
+        # 而且记忆混进评审意见里会变成"记忆在评自己", 越评越偏。
+        #
+        # 改造前: 这里手抄三行 self._memory_context(input_text), 然后把结果拼进
+        # initial_prompt —— 因为这个 Agent 直接用 _chat, 不走 _build_messages,
+        # 基类的注入对它不生效。
+        # 改造后: MemoryHook 默认 once_per_turn=True, "一轮里只喂第一次 LLM 调用",
+        # 而本 Agent 这一轮的第一次调用**就是初稿** —— 策略一模一样,
+        # 但执行它的是 hook, 不是这里的一段手抄代码。
+        #
+        # 想改成"评审也带记忆"? 换个 once_per_turn=False 的 hook 就行, 不用动这个文件。
         initial_prompt = self.custom_prompt["initial"].format(task=input_text)
-        if context:
-            initial_prompt = f"{context}\n\n{initial_prompt}"
         initial_result = self._get_llm_response(initial_prompt, **kwargs)
         self.scratch.add_record("execution", initial_result)
 

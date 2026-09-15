@@ -8,6 +8,7 @@ Agent基类
 
 import copy
 import json
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Iterator, Optional
@@ -15,6 +16,7 @@ from .message import Message, Turn
 from .llm import Agents0to1
 from .config import Config
 from .typedefs import AgentEvent, LLMResponse
+from .hooks import HookPipeline, RunContext
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -29,7 +31,8 @@ class Agent(ABC):
             llm: Agents0to1,
             system_prompt: Optional[str] = None,
             config: Optional[Config] = None,
-            memory: Optional[object] = None
+            hooks: Optional[list] = None,
+            agent_id: Optional[str] = None,
             ):
         self.config = config or Config()
         self.name = name
@@ -42,36 +45,85 @@ class Agent(ABC):
         # 同一个 llm 客户端可能被多个 Agent 共用(llm.last_response 里放的是"最后一次流式调用"的结果, 不区分是哪个 Agent 发起的), 存一份在自己的属性上才不会串台。
         self._last_response: Optional[LLMResponse] = None
 
-        # ==================== 记忆 ====================
+        # 最近一次**发出去**的消息(system + 历史 + 本轮提问, 含 hook 注入进去的内容)。
+        # 语义是"模型当时看到了什么", 调试和快照用 —— 不是 agent 那份会不断 append
+        # 的工作列表(那个是子类内部的东西)。见 _chat / _stream_chat。
+        self.last_messages: list[dict] = []
+
+        # ==================== 身份 ====================
+        #
+        #   name 只是给人和日志看的标签, 不保证唯一、也不保证稳定。
+        #   agent_id 才是身份: 跨进程 / 跨会话 / 记忆归属 / 消息路由都靠它
+        #   (小镇那种"很多个 agent 共用一个向量库"的场景尤其需要)。
+        self.agent_id: str = agent_id or uuid.uuid4().hex[:12]
+
+        # ==================== 扩展点 ====================
         #
         # 四个子类都是用**位置参数**调 super().__init__(name, llm, system_prompt, config)
-        # 要是把 memory 插在 config 前面, 所有位置调用会把 config 静默绑到 memory上又是一个不报错的错误。
-        #
-        # 【类型守卫】memory 的合法形状:
-        #     search()        —— 语义记忆, 按相似度检索
-        #     build_context() —— 情景记忆, 按时间回放 (它没有 search)
-        if memory is not None and not (
-            hasattr(memory, "search") or hasattr(memory, "build_context")
-        ):
-            raise TypeError(
-                f"memory 需要提供 search() 或 build_context() 方法, "
-                f"收到的是 {type(memory).__name__}"
-            )
-        self.memory = memory
+        # 所以 hooks / agent_id 只能加在 config 后面, 而且子类必须用关键字传进来。
+        # 插在 config 前面的话, 所有位置调用会把 config 静默绑到 hooks 上 ——
+        # 又是一个不报错的错误。同一个理由, 见原来 memory 参数那段注释。
+        self._hooks = HookPipeline(hooks)
+        #: 当前这一轮的上下文。run() / stream_run() 建立和清理, 平时是 None。
+        self._ctx: Optional[RunContext] = None
 
     #声明必须实现这个方法！！
+    #
+    # 【为什么是 _run 而不是 run】
+    # run() 现在是**模板方法**(见下面), ctx 的生命周期由框架管, 子类忘不掉。
+    # 改造前每个子类自己实现 run(), 于是"记得建 ctx / 记得清 ctx"就成了
+    # 又一条"必须记得做的事" —— 而"必须记得做的事"正是加记忆要动 9 个文件的病根。
     @abstractmethod
-    def run(self, input_text: str, **kwargs) -> str:
-        """运行Agent"""
+    def _run(self, input_text: str, **kwargs) -> str:
+        """真正干活的实现。**子类覆盖这个, 不要覆盖 run()。**"""
         pass
+
+    def run(self, input_text: str, **kwargs) -> str:
+        """
+        运行Agent —— 模板方法: 建上下文 -> 跑子类实现 -> 收尾。
+
+        **子类不要覆盖这个方法**, 覆盖 _run()。ctx 的生命周期由框架管。
+        """
+        ctx = RunContext(input_text=input_text, agent=self, turn_index=len(self._turns))
+        self._ctx = ctx
+        try:
+            # ⚠️ before_input 是在 ctx.input_text 已经存下**原值**之后才跑的, 这是刻意的:
+            # ctx.input_text 是给 hook 用的"用户到底问了什么", 它不该被任何 hook 改写 ——
+            # 记忆检索的 query 就是它。before_input 改写的是**送进子类的那一份**。
+            # 真被改写时两者不一致, 那个不一致是有意的。
+            return self._run(self._hooks.before_input(ctx, input_text), **kwargs)
+        finally:
+            # 清掉: 否则 add_turn 的 after_run 会在"这一轮早就结束了"之后被触发一次
+            self._ctx = None
 
     def stream_run(self, input_text: str, **kwargs) -> Iterator[AgentEvent]:
         """
         流式运行Agent, 逐块吐出 AgentEvent。
 
-        基类不提供实现(不是所有 Agent 都适合流式), 但把它声明出来,
+        默认实现: 任何实现了 _run() 的 Agent 都能被包成一个"只吐 final"的事件流。
+        想要精细的(工具事件)覆盖 _stream_run() 就好。
+
+        改造前这个方法在基类里只会 raise NotImplementedError, 四个 Agent 里
+        只有两个实现了它 —— 现在四个都有了, 而且不用各自写一遍。
         """
-        raise NotImplementedError(f"{type(self).__name__} 暂不支持流式运行。")
+        ctx = RunContext(input_text=input_text, agent=self, turn_index=len(self._turns))
+        self._ctx = ctx
+        try:
+            yield from self._stream_run(self._hooks.before_input(ctx, input_text), **kwargs)
+        finally:
+            self._ctx = None
+
+    def _stream_run(self, input_text: str, **kwargs) -> Iterator[AgentEvent]:
+        """
+        默认: 退化成 run() 的单个 final 事件。**子类可以覆盖。**
+        (写不出事件流能力的 Agent, 至少不该连"事件流"这个形状都没有。)
+
+        ⚠️ 这里调的是 _run(), **不是 run()**。
+        调 run() 会重新开一个 ctx(把当前这个覆盖掉), 而 ReAct 那种
+        "_run 消费 _stream_run" 的形状会直接**无限递归**。
+        """
+        answer = self._run(input_text, **kwargs)
+        yield AgentEvent(type="final", answer=answer)
 
     # ==================== 拼消息 ====================
 
@@ -97,60 +149,16 @@ class Agent(ABC):
 
     def _build_messages(self, input_text: str) -> list[dict]:
         """
-        拼入口消息: system + 历史 + 当前问题(有记忆时, 检索结果并进这条 user 里)。
+        拼入口消息: system + 历史 + 当前问题。
+
+        **这里没有记忆。** 检索结果由 hook 在 before_llm 阶段并进最后那条 user ——
+        改造前它长在这里, 于是每个"想往 prompt 里塞点东西"的能力都得来改这个方法。
         """
         return (
             self._base_messages()
             + self._history_messages()
-            + [self._prepare_user_message(input_text)]
+            + [{"role": "user", "content": input_text}]
         )
-
-    # ==================== 记忆注入 ====================
-
-    def _prepare_user_message(self, input_text: str) -> dict:
-        """
-        组装最后那条 user 消息。有记忆时把检索结果**并进同一条消息**。
-        """
-        message = {"role": "user", "content": input_text}
-        if self.memory is None:
-            return message
-
-        context = self._memory_context(input_text)
-        if not context:
-            return message
-        return {"role": "user", "content": f"{context}\n\n{input_text}"}
-
-    def _record_first_message(self, input_text: str) -> dict:
-        """
-        进 Turn 的第一条消息  必须是原始输入。
-        _prepare_user_message 把检索结果并进了这条 user 消息, 但那份内容只该活在
-        """
-        return {"role": "user", "content": input_text}
-
-    def _memory_context(self, query: str) -> str:
-        """
-        取记忆上下文。**fail-open 兜底: 任何异常都退化成"没有记忆"。**
-        """
-        if self.memory is None:
-            return ""
-
-        try:
-            build = getattr(self.memory, "build_context", None)
-            if callable(build):
-                return build(query) or ""
-
-            # 只提供 search() 的记忆对象: 由 agent 负责排版,
-            # 这样它和 KnowledgeSearchTool 走的是同一个 format_items, 形状一致
-            items = self.memory.search(query)
-            if not items:
-                return ""
-            format_items = getattr(self.memory, "format_items", None)
-            if callable(format_items):
-                return format_items(items)
-            return "\n\n".join(f"[{i}] {item.text}" for i, item in enumerate(items, 1))
-        except Exception as e:
-            logger.warning("记忆检索失败, 本轮按『没有记忆』继续: %s", e)
-            return ""
 
     def _ensure_system(self, messages: list[dict]) -> list[dict]:
         """
@@ -162,21 +170,66 @@ class Agent(ABC):
 
     # ==================== 调 LLM ====================
 
+    def _hook_ctx(self) -> RunContext:
+        """
+        当前这一轮的 ctx。**run() 之外直接调 _chat 时兜一个临时的空上下文。**
+
+        什么时候会那样调: 手搓 `Planner(agent).plan(...)`、测试里直接捅 _chat、
+        或者谁写了个不走 run() 的循环。那时候 ctx 是 None —— 兜一个临时的,
+        比让 hook 吃到 AttributeError 强: 后者会被 fail-open 静默吞掉, 你只会
+        觉得"记忆好像没生效", 查半天。
+
+        ⚠️ **不把它存进 self._ctx**: 存了的话, 这次临时调用结束后 add_turn 的
+        after_run 会拿这个假上下文触发一次 —— 那才是真的串台。
+        """
+        if self._ctx is not None:
+            return self._ctx
+        return RunContext(input_text="", agent=self)
+
     def _chat(self, messages: list[dict], tools=None, **kwargs) -> LLMResponse:
         """
-        所有 LLM 调用的唯一出口。
+        所有**非流式** LLM 调用的唯一出口。
+
+        【为什么 hook 挂在这而不是挂在 run() 里】
+        run() 只发一次 LLM 的场景(SimpleAgent)看着没问题, 但 ReAct 一轮里调 N 次
+        LLM+工具, PlanSolve 一轮里调 2N+1 次。挂在 run() 上等于"一轮只拦一次",
+        记忆注入、成本熔断、trace 全都只对第一次调用有效 —— 而且不报错。
+        挂在这个出口上, **每一次** LLM 调用都被拦到, 不管是谁发起的。
         """
-        return self.llm.invoke(self._ensure_system(messages), tools=tools, **kwargs)
+        ctx = self._hook_ctx()
+        outgoing = self._hooks.before_llm(ctx, self._ensure_system(messages))
+        response = self.llm.invoke(outgoing, tools=tools, **kwargs)
+
+        # 存"真正发出去的那一份"(含 hook 注入的内容): 语义是"模型当时看到了什么",
+        # 调试和快照用。注意它和子类内部那份不断 append 的工作列表**不是一回事**。
+        self.last_messages = outgoing
+
+        response = self._hooks.after_llm(ctx, response)
+        # 在 hook 之后自增: before_llm / after_llm 里读到的 llm_calls 是"这次是第几次",
+        # 从 0 开始 —— 于是 `if ctx.llm_calls == 0` 就是"这是本轮第一次调用"。
+        ctx.llm_calls += 1
+        return response
 
     def _stream_chat(self, messages: list[dict], tools=None, **kwargs) -> Iterator[str]:
         """
-        流式版本, 同样强制注入 system。
+        流式版本, 同样强制注入 system, 同样过 hook。
+
+        ⚠️ 与 _chat 的**唯一不对称**: after_llm 在流式路径上**只能观察, 不能改**。
+        chunk 是边生成边 yield 出去的, 等 after_llm 跑到的时候调用方早就把字符
+        拿去用了 —— 改 self._last_response 对已经吐出去的内容没有任何影响。
+        做 usage 统计 / trace 没问题, 做内容审核只有非流式路径有效。
+        这个不对称是流式的固有代价, 消除不掉, 只能写清楚。
         """
-        yield from self.llm.stream_invoke(self._ensure_system(messages), tools=tools, **kwargs)
+        ctx = self._hook_ctx()
+        outgoing = self._hooks.before_llm(ctx, self._ensure_system(messages))
+        self.last_messages = outgoing
+
+        yield from self.llm.stream_invoke(outgoing, tools=tools, **kwargs)
 
         # 只在生成器被完整消费后才会执行到这里 —— 提前 break 的调用方拿不到新值,
         # 这正是"流式调用的固有语义", 不是 bug。
-        self._last_response = self.llm.last_response
+        self._last_response = self._hooks.after_llm(ctx, self.llm.last_response)
+        ctx.llm_calls += 1
 
     # ==================== 历史 ====================
     #
@@ -222,6 +275,20 @@ class Agent(ABC):
 
         self._turns.append(turn)
         self._truncate_history()
+
+        # 4. after_run —— 一轮真正结束了。落库、打分、写记忆流都在这个阶段。
+        #
+        # 【为什么挂在 add_turn 里, 而不是子类的 run() 结尾】
+        # 因为 add_turn 是**所有**写入路径的汇合点: add_turn / add_message /
+        # _record_turn 最后都走到这。挂在这儿,"一轮结束了"这件事只有一个定义 ——
+        # 挂在子类里的做法, 四个子类就有四种定义, 而且第五个子类会漏掉。
+        #
+        # self._ctx is None 的两种情况: ① 有人在 run() 之外直接调 add_turn
+        # (add_message 那条老路径) ② 上一轮已经结束、ctx 被清掉了。
+        # 两种都不该凭空捏一个 ctx 出来 —— 那会让 hook 拿到空 input_text 还以为
+        # 自己在一轮真实的对话里。
+        if self._ctx is not None:
+            self._hooks.after_run(self._ctx, turn)
 
     @staticmethod
     def _turn_chars(turn: Turn) -> int:
@@ -350,16 +417,23 @@ class Agent(ABC):
     # 函数注解在 def 执行时求值, 所以 3.9 上 import 这个模块会直接 TypeError。
     # pyproject 里的 requires-python 已经同步成 ">=3.10", 两边别改岔了。
     #
-    # 【memory **不进**快照, 这是明确的设计】
-    # snapshot() 用的是 json.dumps(..., default=str)。一个活的向量库句柄塞进去,
-    # 会被**静默序列化**成 "<memory.semantic.SemanticMemory object at 0x...>"
-    # 这样一串字符串 —— 不报错。然后 _from_snapshot 的 setdefault 会把这串
-    # 字符串喂给构造函数, 直到第一次调 LLM 才炸, 报错位置离病因十万八千里。
+    # 【hooks **不进**快照, 这是明确的设计】
+    # snapshot() 用的是 json.dumps(..., default=str)。一个活的向量库 / 数据库
+    # 连接 / HTTP 客户端句柄塞进去, 会被**静默序列化**成
+    # "<memory.semantic.SemanticMemory object at 0x...>" 这样一串字符串 ——
+    # 不报错。然后 _from_snapshot 的 setdefault 会把这串字符串喂给构造函数,
+    # 直到第一次调 LLM 才炸, 报错位置离病因十万八千里。
     #
     # 所以: 想让恢复出来的 agent 也带记忆, 显式传 ——
-    #     SemanticMemory.load(...) 是不存在的, 直接:
-    #     ReActAgent.load("s.json", tool_registry=r, memory=mem)
+    #     SimpleMemory.load(...) 是不存在的, 直接:
+    #     ReActAgent.load("s.json", tool_registry=r, hooks=[MemoryHook(mem)])
     # 靠现有的 setdefault 机制**天然就支持覆盖**, 不用额外写代码。
+    #
+    # 【agent_id 进快照, 但 fork() 会换一个新的】
+    # 恢复(load)是"同一个 agent 又回来了": 记忆归属、消息路由都该认得它,
+    # 所以沿用快照里的 id。
+    # fork() 是"另起一个": 同一份历史, 换提示词/换模型跑对照实验 —— 那是两个
+    # agent, 共用一个 id 的话, 向量库里两边的记忆会互相认亲。
     #
 
     SNAPSHOT_VERSION = 1
@@ -375,6 +449,7 @@ class Agent(ABC):
         return {
             "version": self.SNAPSHOT_VERSION,
             "agent_type": type(self).__name__,
+            "agent_id": self.agent_id,
             "name": self.name,
             "system_prompt": self.system_prompt,
             "llm": {
@@ -426,6 +501,9 @@ class Agent(ABC):
 
         # 快照里的值只做**默认值**: 调用方显式传的优先 —— fork 就靠这条实现
         init_kwargs.setdefault("name", data.get("name", "restored"))
+        # 旧快照(这个字段之前存的)没有 agent_id -> 这里给 None -> 构造函数重新生成一个。
+        # 不强求: 让"能读旧快照"这件事继续成立, 比"id 必须沿袭"重要。
+        init_kwargs.setdefault("agent_id", data.get("agent_id"))
         init_kwargs.setdefault("system_prompt", data.get("system_prompt"))
         if data.get("config"):
             init_kwargs.setdefault("config", Config.model_validate(data["config"]))
@@ -467,7 +545,13 @@ class Agent(ABC):
 
             a = ReActAgent.fork("s.json", tool_registry=r)
             b = ReActAgent.fork("s.json", tool_registry=r, system_prompt="只回答数字")
+
+        【分叉出来的 agent_id 是新的】
+        load() 沿用快照里的 id(同一个 agent 又回来了), fork() 换一个新的 ——
+        它是"另起一个", 两边共用一个 id 会让记忆归属、消息路由认错人。
+        要显式指定就 overrides 里传 agent_id=。
         """
+        overrides.setdefault("agent_id", uuid.uuid4().hex[:12])
         return cls.load(path, **overrides)
 
     def __str__(self) -> str:

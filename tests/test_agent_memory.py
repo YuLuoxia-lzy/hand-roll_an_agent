@@ -1,12 +1,18 @@
-"""Agent 接入测试 —— 第五步是整个方案最容易做错的地方
+"""Agent 接入测试 —— 记忆这条链路上每一个坑都在这里
 
     python tests/test_agent_memory.py
 
-这个文件里每一条都对应指南第五步里的一个坑, 注释写清楚了"如果不这样就
+这个文件里每一条都对应记忆接入的一个坑, 注释写清楚了"如果不这样就
 会发生什么"。全部离线, 用假 LLM + 假记忆, 不花钱。
 
 用的都是 FakeLLM 记下来的**"我们到底发了什么给模型"** —— 验证记忆有没有生效,
 靠的从来不是"模型说了什么", 而是"请求里有什么"。
+
+【改造后这 33 条为什么还全绿, 以及为什么只改了挂载方式】
+挂载从 `memory=mem` 换成了 `hooks=[MemoryHook(mem)]`(两个辅助函数里各一行),
+除此之外**没有放水** —— 一条断言都没改弱, 该断言的行为一条没少。
+这 33 条是照着"记忆已经接对了"写的, 它们还能过, 就说明搬到 hook 之后
+行为没有退化。这条比任何"设计得真漂亮"的自评都硬。
 """
 
 import inspect
@@ -23,7 +29,9 @@ from _harness import FakeEmbedder, FakeLLM, TempDir, run_tests       # noqa: E40
 from agents0to1 import (                                             # noqa: E402
     CalculatorTool,
     Config,
+    Hook,
     KnowledgeSearchTool,
+    MemoryHook,
     PlanAndSolveAgent,
     ReActAgent,
     ReflectionAgent,
@@ -80,16 +88,32 @@ class EchoTool(Tool):
         return f"回显: {parameters.get('text', '')}"
 
 
-def _simple(llm, memory=None, **kwargs):
-    return SimpleAgent("test", llm, system_prompt="你是助手", memory=memory, **kwargs)
+def _simple(llm, memory=None, hooks=None, **kwargs):
+    """
+    【辅助函数里参数还叫 memory, 是有意的】
+
+    这个文件里三十多条测试关心的是"挂上记忆之后 agent 的行为", 不是"记忆是
+    怎么挂上去的"。让它们继续写 `_simple(llm, memory=mem)`, 挂载方式的改变
+    就只发生在这两个辅助函数里 —— 而挂载方式恰恰是**没变的那部分语义**
+    (一条 `hooks=[MemoryHook(mem)]`, 见下面的 hooks= 分支)。
+
+    要测 hook 管线本身, 走 tests/test_hooks.py, 不在这。
+    """
+    hook_list = list(hooks or [])
+    if memory is not None:
+        hook_list.append(MemoryHook(memory))
+    return SimpleAgent("test", llm, system_prompt="你是助手", hooks=hook_list, **kwargs)
 
 
-def _react(llm, memory=None, registry=None):
+def _react(llm, memory=None, registry=None, hooks=None):
+    hook_list = list(hooks or [])
+    if memory is not None:
+        hook_list.append(MemoryHook(memory))
     return ReActAgent(
         "test", llm,
         tool_registry=registry or ToolRegistry(),
         system_prompt="你是助手",
-        memory=memory,
+        hooks=hook_list,
     )
 
 
@@ -157,10 +181,10 @@ def test_injected_context_is_not_stored_in_turn():
     """
     【本文件最重要的一条】
 
-    钩子挂在 _build_messages 上, 而 turn_start 是在它返回**之后**才算的,
-    所以插进去的内容天然落在 turn_start 之前 -> 不会被存进 Turn -> 零拷贝。
+    注入发生在 before_llm 阶段, 而 hook 返回的是**新列表** ——
+    agent 手里那份 messages 从头到尾都是干净的, 存进 Turn 的自然是干净的。
 
-    如果不小心挂到了 _chat 上、或者插在了 turn_start 之后, 会发生:
+    要是 hook 图省事原地改了 messages[i]["content"], 会发生:
     历史膨胀、快照膨胀、下一轮把上一轮的检索结果当历史重发、
     _turn_chars 的预算被白白吃掉 —— 而且**一个错都不报**。
     """
@@ -194,9 +218,15 @@ def test_react_turn_does_not_store_the_context():
     【上面那条只证明了 SimpleAgent —— ReAct 得单独盯, 而这个差别害人】
 
     SimpleAgent 记的是 (input_text, answer) 两个值, 天然干净。
-    ReAct 记的是 messages[turn_start:](react_agent.py:239), 而
-    turn_start = len(messages) - 1 **正好指向那条已被注入记忆的 user 消息** ——
-    所以"注入天然不进 Turn"这句话对 ReAct 是**错的**, 得显式还原。
+    ReAct 记的是 messages[turn_start:], 而 turn_start = len(messages) - 1
+    **正好指向那条已被注入记忆的 user 消息** —— 所以"注入天然不进 Turn"
+    这句话对 ReAct 是**错的**。
+
+    改造前是靠 react_agent._finish 里手工还原第一条来兜的
+    (Agent._record_first_message)。现在兜底的是 hook 的**不可变约定**:
+    before_llm 返回的是新列表, 注入的那份从头到尾没进过 messages 这个活列表 ——
+    于是"存进 Turn"这件事连机会都没有, 那个补丁整个删掉了。
+    这条测试从"盯一个补丁"变成了"盯那个约定"。
 
     这个 bug 是写这个文件时才发现的: 上面那条测试绿着, 因为它是 SimpleAgent。
     """
@@ -252,14 +282,19 @@ def test_query_uses_input_text_on_first_step():
 
 def test_react_step_two_still_queries_with_input_text():
     """
-    【必须用 input_text 参数本身, 绝对不能用 messages[-1]["content"]】
+    【检索用 input_text, 绝不能用 messages[-1]["content"]】
 
     真写成"从 messages[-1] 取查询词"的话, ReAct 第 2 步的消息末尾是**工具结果**,
     于是每一步都在拿上一步的工具结果去检索 —— 检索出来的东西和用户问题毫无关系,
     而且它不报错, 你只会觉得"记忆好像没什么用"。
 
-    这里的实现是: 在 _build_messages 里用 input_text 检索一次, 然后把这条带记忆的
-    user 消息留在列表里, 后续步骤往它**后面**追加。
+    改造前这条约束是**靠人记住**的。现在 MemoryHook 用的是 ctx.input_text,
+    而 RunContext 保证它永远是本轮原始输入, 不管你挂在哪个阶段、第几次调用 ——
+    约束从"记得这么做"变成了"结构上不可能做错"。
+
+    另外这条还盯着一件事: **第 2 步的请求里也必须有记忆**。
+    倒着找最后一条 user 消息而不是只看 messages[-1], 就是为了这个 ——
+    第 2 步往往才是模型给最终答案的那一步。
     """
     mem = RecordingMemory()
     registry = ToolRegistry()
@@ -296,7 +331,8 @@ def test_plan_solve_does_not_query_with_the_instruction_template():
         (None, [ToolCall(id="p1", name="submit_plan", arguments={"plan": ["第一步"]})]),
         "第一步的结果",
     ])
-    agent = PlanAndSolveAgent("test", llm, system_prompt="你是助手", memory=mem)
+    agent = PlanAndSolveAgent("test", llm, system_prompt="你是助手",
+                              hooks=[MemoryHook(mem, once_per_turn=False)])
     agent.run("用户的问题")
 
     assert mem.queries, "PlanSolve 根本没检索"
@@ -308,15 +344,25 @@ def test_plan_solve_does_not_query_with_the_instruction_template():
 # ==================== 各 Agent 的注入点不一样 ====================
 
 def test_plan_solve_retrieves_only_once():
-    """在 run() 里算一次, 显式传进 planner 和 executor —— 每一步都重检的话,
-    同一份资料会在不同步骤里被检索出不同片段, 结果没法复现。"""
+    """
+    **检索**只做一次(缓存在 ctx.state), 但**注入**每一次都要做。
+
+    为什么这个 Agent 得写 once_per_turn=False: 它每一次 LLM 调用都是一条
+    全新拼出来的 prompt(规划一条、每一步一条), 规划那次注入的东西根本流不到
+    执行第几步里去。对 SimpleAgent / ReAct 正确的"一轮只认一个目标",
+    在它这儿等于"只有规划看得见记忆, 每一步都看不见"。
+
+    为什么检索还是只做一次: 每一步都重新检索的话, 同一份资料会在不同的步骤里
+    被检索出不同的片段, 结果没法复现。
+    """
     mem = RecordingMemory(context="【记忆】部署手册在这里。")
     llm = FakeLLM([
         (None, [ToolCall(id="p1", name="submit_plan", arguments={"plan": ["第一步", "第二步"]})]),
         "结果一",
         "结果二",
     ])
-    agent = PlanAndSolveAgent("test", llm, system_prompt="你是助手", memory=mem)
+    agent = PlanAndSolveAgent("test", llm, system_prompt="你是助手",
+                              hooks=[MemoryHook(mem, once_per_turn=False)])
     agent.run("用户的问题")
 
     assert mem.context_calls == 1, f"检索了 {mem.context_calls} 次, 应该只检索一次"
@@ -337,32 +383,39 @@ def test_reflection_feeds_only_the_initial_draft():
     """
     mem = RecordingMemory(context="【记忆】参考资料。")
     llm = FakeLLM(["初稿", "无需改进"])
-    agent = ReflectionAgent("test", llm, system_prompt="你是助手", memory=mem)
+    agent = ReflectionAgent("test", llm, system_prompt="你是助手",
+                            hooks=[MemoryHook(mem)])
     agent.run("用户的任务")
 
     assert mem.context_calls == 1, f"检索了 {mem.context_calls} 次"
     first, second = (c["messages"][-1]["content"] for c in llm.calls[:2])
     assert "【记忆】" in first, "初稿没带上记忆"
     assert "【记忆】" not in second, "评审也带上记忆了 —— 会变成记忆在评自己"
+    # ↑ 这条现在是 hook 自己判出来的: 评审 prompt 的**内容和注入目标不一样**,
+    #   于是"一轮只认一个目标"自动把它挡掉。不需要 Reflection 里写任何代码。
 
 
 def test_reflection_scratch_does_not_clobber_memory():
     """
-    【命名冲突的坑】
+    【命名冲突的坑 —— 现在整个消失了】
 
-    ReflectionAgent 原来有个 self.memory(本轮的草稿轨迹), 而基类现在
-    也要用 self.memory 放记忆对象 —— 基类那个会被 run() 静默冲掉,
-    结果是"记忆挂上了但一个字符都没生效", 从日志里完全看不出来。
+    ReflectionAgent 原来有个 self.memory(本轮的草稿轨迹), 而基类也要用
+    self.memory 放记忆对象 —— 基类那个会被子类静默冲掉, 结果是"记忆挂上了
+    但一个字符都没生效", 从日志里完全看不出来。
+    当时的修法是重命名: 草稿轨迹改叫 self.scratch。
 
-    现在: self.memory 归基类, 草稿轨迹叫 self.scratch。
+    hook 之后, 基类**不再拥有 memory 这个属性** —— 记忆活在 MemoryHook 里。
+    冲突不是被绕开了, 是没有了: 框架和应用不再抢同一个名字。
     """
     mem = RecordingMemory()
     llm = FakeLLM(["初稿", "无需改进"])
-    agent = ReflectionAgent("test", llm, system_prompt="你是助手", memory=mem)
+    hook = MemoryHook(mem)
+    agent = ReflectionAgent("test", llm, system_prompt="你是助手", hooks=[hook])
 
-    assert agent.memory is mem, "self.memory 被草稿轨迹冲掉了"
+    assert not hasattr(agent, "memory"), "基类又把 memory 抢回去了"
+    assert hook.memory is mem, "hook 里的记忆被冲掉了"
     agent.run("任务")
-    assert agent.memory is mem, "run() 之后 self.memory 被冲掉了"
+    assert hook.memory is mem, "run() 之后 hook 里的记忆被冲掉了"
     assert agent.scratch.get_last_execution() == "初稿"
 
 
@@ -445,32 +498,49 @@ def test_react_does_not_rerun_tools_when_memory_fails():
 
 # ==================== 参数与命名(位置调用会静默错绑) ====================
 
-def test_memory_is_the_last_parameter_of_every_agent():
+def test_new_parameters_only_ever_come_after_config():
     """
+    【位置参数会静默错绑, 这条是防它的】
+
     四个子类都是用**位置参数**调 super().__init__(name, llm, system_prompt, config)。
-    把 memory 插在 config 前面的话, 所有位置调用会把 config **静默绑到 memory** 上。
+    改造前这条盯的是"memory 必须在参数表最后"; 现在 memory 没了, 换成 hooks /
+    agent_id —— 规矩一个字没变:
+
+        **新增的构造参数只能加在 config 后面, 且子类必须用关键字传给基类。**
+
+    插在 config 前面的话, 所有位置调用会把 config **静默绑到 hooks** 上
+    (config.temperature 变成 pipeline.temperature —— 不报错, 只是行为全变)。
     """
     for cls in (SimpleAgent, ReActAgent, ReflectionAgent, PlanAndSolveAgent):
         params = list(inspect.signature(cls.__init__).parameters)
-        assert params[-1] == "memory", f"{cls.__name__} 的 memory 不在参数表最后: {params}"
+        assert "memory" not in params, f"{cls.__name__} 还留着 memory 参数: {params}"
+        assert "hooks" in params, f"{cls.__name__} 没有 hooks 参数: {params}"
+        assert params.index("hooks") > params.index("config"), (
+            f"{cls.__name__} 的 hooks 插到 config 前面了 —— 位置调用会静默错绑: {params}"
+        )
 
 
 def test_positional_call_binds_config_correctly():
     cfg = Config(temperature=0.11)
     agent = SimpleAgent("n", FakeLLM(["答案"]), "人设", cfg)
     assert agent.config is cfg, "config 被绑到别的参数上了"
-    assert agent.memory is None
+    # 记忆不再是 agent 的属性 —— 它活在 hook 里, 基类不再抢这个名字
+    assert not hasattr(agent, "memory")
+    assert len(agent._hooks) == 0, "没传 hooks, 管线该是空的"
 
 
 def test_bad_memory_is_rejected_early():
-    """构造函数加类型守卫, 和项目已有的 isinstance(agent, Agent) 守卫风格一致"""
+    """守卫搬进了 MemoryHook 的构造函数, 和项目已有的 isinstance(agent, Agent) 风格一致。
+
+    为什么守卫必须留在**构造时**: 传错了要当场报错。等到第一次调 LLM 才炸的话,
+    报错位置离病因十万八千里(而且 fail-open 还会把它静默吞掉)。
+    """
     try:
-        SimpleAgent("n", FakeLLM(["答案"]), memory={"这不是记忆": True})
+        MemoryHook({"这不是记忆": True})
     except TypeError as e:
         assert "search" in str(e) or "build_context" in str(e), e
         return
-    raise AssertionError("传了个字典当 memory, 应该当场报错 —— "
-                         "否则会在第一次调 LLM 时才炸, 报错位置离病因十万八千里")
+    raise AssertionError("传了个字典当 memory, 应该当场报错")
 
 
 def test_memory_accepts_search_only_object():
@@ -479,7 +549,10 @@ def test_memory_accepts_search_only_object():
         def search(self, query, top_k=None, min_score=None):
             return []
 
-    SimpleAgent("n", FakeLLM(["答案"]), memory=SearchOnly())
+    llm = FakeLLM(["答案"])
+    agent = SimpleAgent("n", llm, hooks=[MemoryHook(SearchOnly())])
+    agent.run("问题")
+    assert llm.calls[0]["messages"][-1] == {"role": "user", "content": "问题"}
 
 
 # ==================== 快照: memory 不进快照 ====================
@@ -496,6 +569,7 @@ def test_snapshot_excludes_memory():
 
     snap = agent.snapshot()
     assert "memory" not in snap, "memory 进了快照"
+    assert "hooks" not in snap, "hooks 进了快照 —— 它比 memory 更危险(里面装着活的记忆对象)"
 
     text = json.dumps(snap, ensure_ascii=False, default=str)
     assert "object at 0x" not in text, f"有活对象被字符串化了:\n{text[:300]}"
@@ -513,7 +587,7 @@ def test_snapshot_roundtrip_without_memory():
         # 于是它去读环境变量 —— 有 .env 的机器上恰好能读到, 这条就"绿"了。
         # 一颗靠环境变量捂住的红灯, 比一颗红的红灯危险得多: 它只在别人机器上红。
         restored = SimpleAgent.load(str(path), llm=FakeLLM(["答案"]))
-        assert restored.memory is None, "从快照恢复出来的 agent 不该凭空有记忆"
+        assert len(restored._hooks) == 0, "从快照恢复出来的 agent 不该凭空有记忆"
         assert restored.get_turns()[0].user == "问题"
 
 
@@ -526,10 +600,11 @@ def test_load_can_attach_memory_explicitly():
         agent.save(path)
 
         mem = RecordingMemory()
+        hook = MemoryHook(mem)
         # 显式传 llm: 不传的话 _from_snapshot 会照着快照里的 provider 建一个真客户端,
         # 下一行 run() 就会真的去连网 —— 那这个"离线测试"就跑不起来了
-        restored = SimpleAgent.load(str(path), llm=FakeLLM(["答案"]), memory=mem)
-        assert restored.memory is mem
+        restored = SimpleAgent.load(str(path), llm=FakeLLM(["答案"]), hooks=[hook])
+        assert hook.memory is mem
         restored.run("新问题")
         assert mem.queries == ["新问题"]
 

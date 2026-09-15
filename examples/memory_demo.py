@@ -7,7 +7,7 @@
 【这个示例打印的不是"结果好不好看", 而是三件证据】
   ① 发给模型的 messages 里, 检索结果**并进了最后那条 user 消息**(不是新增一条)
   ② Turn 里存的东西**不含**检索结果(下一轮不会把它当历史重发)
-  ③ 快照里**没有** memory(活对象进 json.dumps 会被静默字符串化)
+  ③ 快照里**没有** memory / hooks(活对象进 json.dumps 会被静默字符串化)
 
 离线模式为什么可以"零配置": 假 embedder 用字符 trigram 做哈希袋 —— 它验证不了
 语义(那需要真模型), 但足以让切分、入库、检索、注入、记录这五步全都真跑一遍。
@@ -30,6 +30,7 @@ from _harness import FakeEmbedder, FakeLLM, TempDir          # noqa: E402
 from agents0to1 import (                                     # noqa: E402
     EpisodicMemory,
     KnowledgeSearchTool,
+    MemoryHook,
     ReActAgent,
     SemanticMemory,
     SimpleAgent,
@@ -143,7 +144,8 @@ def demo_semantic(embedder, tag: str):
         # --- 挂到 Agent 上, 看证据 ---
         hr("② 注入: 检索结果去哪了")
         llm = FakeLLM(["出差住宿一线城市每晚不超过 600 元。"])
-        agent = SimpleAgent("demo", llm, system_prompt="你是差旅助手", memory=mem)
+        agent = SimpleAgent("demo", llm, system_prompt="你是差旅助手",
+                            hooks=[MemoryHook(mem)])
         answer = agent.run("住宿一晚最多能报多少")
 
         show_request(llm)
@@ -165,15 +167,18 @@ def demo_semantic(embedder, tag: str):
         print("  (否则幻觉会被自己的记忆反复加固: 编一个说法 -> 入库 -> 下次当成事实检索出来)")
 
         # --- 快照 ---
-        hr("③ 快照: memory 不该进去")
+        hr("③ 快照: 记忆/活对象不该进去")
         snap = agent.snapshot()
         print(f"  快照顶层字段: {sorted(snap)}")
         print(f"  有 'memory' 吗: {'memory' in snap}")
+        print(f"  有 'hooks' 吗:  {'hooks' in snap}")
         text = json.dumps(snap, ensure_ascii=False, default=str)
         print(f"  json.dumps(default=str) 之后有被字符串化的活对象吗: "
               f"{'object at 0x' in text}")
-        print("  ↑ 活对象塞进快照会被**静默**变成 '<... object at 0x...>', 不报错,")
+        print("  ↑ 活对象(向量库句柄、db 连接)塞进快照会被**静默**变成 "
+              "'<... object at 0x...>', 不报错,")
         print("     直到 load 出来第一次调 LLM 才炸, 报错位置离病因十万八千里。")
+        print("     恢复时显式传: SimpleAgent.load(path, hooks=[MemoryHook(mem)])")
 
         mem.close()
 
@@ -196,7 +201,7 @@ def demo_tool(embedder, tag: str):
             "一线城市每晚不超过 600 元。",
         ])
         agent = ReActAgent("demo", llm, tool_registry=registry,
-                           system_prompt="你是差旅助手", memory=mem)
+                           system_prompt="你是差旅助手", hooks=[MemoryHook(mem)])
         answer = agent.run("住宿一晚最多能报多少")
 
         for i, call in enumerate(llm.calls):
@@ -264,7 +269,8 @@ def demo_fail_open(embedder, tag: str):
         print("     ↑ 空字符串, 不抛 —— 它正对着 LLM 漏斗, 抛出去的后果是整个 agent 挂掉")
 
         llm = FakeLLM(["答案"])
-        agent = SimpleAgent("demo", llm, system_prompt="你是助手", memory=mem)
+        agent = SimpleAgent("demo", llm, system_prompt="你是助手",
+                            hooks=[MemoryHook(mem)])
         agent.run("问题")
         print(f"  agent 照常跑完, 发给模型的还是 {len(llm.calls[0]['messages'])} 条消息, "
               f"和『没有记忆』逐字节相同")
@@ -316,7 +322,7 @@ def main():
 
     hr()
     print("  跑完了。接下来:" if real else "  离线跑完了(上面全是假 embedder)。接下来:")
-    print("    python tests/run_offline.py         # 94 个离线用例, 改完代码的标准动作")
+    print("    python tests/run_offline.py         # 146 个离线用例, 改完代码的标准动作")
     print("    python tests/bench_storage.py       # BLOB vs JSON 差多少, 亲手量一遍")
     print("    python tests/test_online.py         # 真 embedding 才能验的语义检索")
     print("    python examples/memory_demo.py --real   # 这个示例接真模型再跑一遍")

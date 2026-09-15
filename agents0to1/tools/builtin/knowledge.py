@@ -33,8 +33,8 @@ class KnowledgeSearchTool(Tool):
     用法:
         mem = SemanticMemory()
         registry.register_tool(KnowledgeSearchTool(mem))
-        agent = ReActAgent("a", llm, tool_registry=registry, memory=mem)
-        #                                            ^^^^^^^^^^^
+        agent = ReActAgent("a", llm, tool_registry=registry, hooks=[MemoryHook(mem)])
+        #                                                        ^^^^^^^^^^^^^^^^
         # 两个都挂上是有意的: 工具版是"模型主动去查", 上下文版是"每次都自动带上"。
         # 只挂工具版, 你会亲眼看到"模型有时候想不起来查"是什么样子。
 
@@ -69,7 +69,7 @@ class KnowledgeSearchTool(Tool):
                 f"KnowledgeSearchTool 需要一个提供 search() 的记忆对象, "
                 f"收到的是 {type(memory).__name__}。"
                 f"(情景记忆 EpisodicMemory 是按时间回放的, 它没有 search —— "
-                f"那个应该用 memory= 挂给 Agent, 而不是做成工具)"
+                f"那个应该用 hooks=[MemoryHook(mem)] 挂给 Agent, 而不是做成工具)"
             )
         super().__init__(name=name, description=description or DEFAULT_KNOWLEDGE_DESCRIPTION)
         self.memory = memory

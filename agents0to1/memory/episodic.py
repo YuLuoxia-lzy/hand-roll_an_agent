@@ -52,7 +52,7 @@ class EpisodicMemory:
         # 取: 下次启动, 把历史灌回去, 接着聊
         store.replay_into(agent, limit=20)
         # 或者: 作为"你说过什么"的上下文注入
-        agent = SimpleAgent("a", llm, memory=store)
+        agent = SimpleAgent("a", llm, hooks=[MemoryHook(store)])
     """
 
     _SCHEMA = """
@@ -97,6 +97,19 @@ class EpisodicMemory:
 
         logger.info("情景记忆就绪: path=%s session=%s", self.path, self.session_id)
 
+    def _require_open(self) -> None:
+        """
+        关掉之后再用, 给一句人话(和 vector_store 同一个理由)。
+
+        不加的话报的是 `AttributeError: 'NoneType' object has no attribute 'execute'`
+        —— 既没说"这个库已经关了", 也没说是谁关的。
+        """
+        if self._conn is None:
+            raise EpisodicMemoryException(
+                f"情景记忆已经关闭(path={self.path}, session={self.session_id}), "
+                f"不能再用了。close() 之后连 count() 都不行。"
+            )
+
     # ==================== 写 ====================
 
     def append(self, turn: Turn) -> int:
@@ -105,6 +118,7 @@ class EpisodicMemory:
 
         序号自动往后排 —— 调用方不需要自己维护计数器, 也就不可能排错。
         """
+        self._require_open()
         with self._lock:
             row = self._conn.execute(
                 f"SELECT COALESCE(MAX(turn_index), -1) + 1 AS next FROM {self.table} "
@@ -157,6 +171,7 @@ class EpisodicMemory:
 
     def recent(self, limit: int = 20, session_id: Optional[str] = None) -> List[Turn]:
         """取最近 limit 轮, **按时间正序**返回(方便直接拼回历史)。"""
+        self._require_open()
         sid = session_id or self.session_id
         with self._lock:
             rows = self._conn.execute(
@@ -198,6 +213,7 @@ class EpisodicMemory:
 
     def sessions(self) -> List[str]:
         """库里有哪几个会话"""
+        self._require_open()
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT DISTINCT session_id FROM {self.table} ORDER BY session_id"
@@ -205,6 +221,7 @@ class EpisodicMemory:
         return [r["session_id"] for r in rows]
 
     def count(self, session_id: Optional[str] = None) -> int:
+        self._require_open()
         sid = session_id or self.session_id
         with self._lock:
             return self._conn.execute(
@@ -225,7 +242,7 @@ class EpisodicMemory:
         【为什么 query 参数收了却没用】
         情景记忆是**按时间**检索的, 不是按相似度 —— "最近说过什么"和"当前问题像不像"
         基本无关。参数留着是为了和 SemanticMemory.build_context 的签名兼容,
-        这样两者都能直接塞给 Agent 的 memory=(见 core/agent.py 的类型守卫)。
+        这样两者都能直接塞给 MemoryHook(见 agents0to1/hooks/memory.py 的类型守卫)。
 
         【为什么只取最近的几轮, 而不是全部】
         完整历史本来就该走 agent._turns(那是零成本的, 不需要每次重新拼),
@@ -263,6 +280,7 @@ class EpisodicMemory:
 
     def clear(self, session_id: Optional[str] = None) -> int:
         """清掉一个会话, 返回删了几轮"""
+        self._require_open()
         sid = session_id or self.session_id
         with self._lock:
             n = self.count(sid)

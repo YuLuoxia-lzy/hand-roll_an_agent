@@ -72,25 +72,24 @@ class Planner:
         self.agent = agent
         self.prompt_template = prompt_template if prompt_template else DEFAULT_PLANNER_PROMPT
 
-    def plan(self, question: str, context: Optional[str] = None, **kwargs) -> List[str]:
+    def plan(self, question: str, **kwargs) -> List[str]:
         """
         生成执行计划
 
         Args:
             question: 要解决的问题
-            context:  记忆上下文(由 PlanAndSolveAgent.run 算好传进来)。
-                      规划器自己不知道有记忆这回事, 也不该知道
             **kwargs: LLM调用参数
 
         Returns:
             步骤列表
 
-        注意: 规划 不带对话历史。计划是针对"这一个问题"的一次性推理,
+        注意 ①: 规划 不带对话历史。计划是针对"这一个问题"的一次性推理,
         system 仍由 agent._chat 注入, 所以人设照常生效。
+        注意 ②: 这里**没有 context 参数了**。记忆由 MemoryHook 在 before_llm
+        阶段注入——规划器从此完全不知道有记忆这回事(以前它得知道, 还得把
+        一段和它无关的文本拼进 prompt)。
         """
         prompt = self.prompt_template.format(question=question)
-        if context:
-            prompt = f"{context}\n\n{prompt}"
 
         # 用 tools= 关键字传: 上一版是位置参数 invoke(messages, [SUBMIT_PLAN_TOOL]),
         # 一旦函数签名调整(比如加个 temperature), 工具清单就会被绑到别的参数上, 且不报错。
@@ -132,20 +131,20 @@ class Executor:
         self.agent = agent
         self.prompt_template = prompt_template if prompt_template else DEFAULT_EXECUTOR_PROMPT
 
-    def execute(self, question: str, plan: List[str], context: Optional[str] = None, **kwargs) -> str:
+    def execute(self, question: str, plan: List[str], **kwargs) -> str:
         """
         按计划执行任务
 
         Args:
             question: 原始问题
             plan: 执行计划
-            context:  记忆上下文(同样由 run 算好传进来, **只检索一次**,
-                      每一步复用 —— 每一步都重新检索的话, 同一份资料会在
-                      不同的步骤里被检索出不同的片段, 结果没法复现)
             **kwargs: LLM调用参数
 
         Returns:
             最终答案
+
+        和 plan() 一样, context 参数没了 —— 每一步的 prompt 都会被动过
+        before_llm 的 hook 注入(见 PlanAndSolveAgent 的 hooks 说明)。
         """
         history = ""
         final_answer = ""
@@ -157,8 +156,6 @@ class Executor:
                 history=history if history else "无",
                 current_step=step
             )
-            if context:
-                prompt = f"{context}\n\n{prompt}"
             # 每一步同样是"任务内部的分步提示", 不带对话历史 ——
             response_text = self.agent._chat(
                 [{"role": "user", "content": prompt}], **kwargs
@@ -190,7 +187,8 @@ class PlanAndSolveAgent(Agent):
         system_prompt: Optional[str] = None,
         config: Optional[Config] = None,
         custom_prompts: Optional[Dict[str, str]] = None,
-        memory: Optional[object] = None
+        hooks: Optional[list] = None,
+        agent_id: Optional[str] = None,
     ):
         """
         初始化PlanAndSolveAgent
@@ -200,11 +198,20 @@ class PlanAndSolveAgent(Agent):
             system_prompt: 系统提示词
             config: 配置对象
             custom_prompts: 自定义提示词模板 {"planner": "", "executor": ""}
-            memory: 记忆对象。**这个 Agent 的记忆不走基类钩子** ——
-                    它的 messages[-1] 是"指令模板"而不是用户问题,
-                    所以记忆在 run() 里算一次, 显式传进 prompt。
+            hooks: 扩展点。
+                ⚠️ **给这个 Agent 挂记性, 记得加 once_per_turn=False**:
+
+                    PlanAndSolveAgent("a", llm, hooks=[MemoryHook(mem, once_per_turn=False)])
+
+                为什么它和别人不一样: 本 Agent 的每一次 LLM 调用都是一条
+                **全新拼出来的 prompt**(规划一条、每一步一条), 规划那次注入的东西
+                根本流不到执行第几步里去。对 SimpleAgent / ReAct 正确的
+                "一轮只注入一次", 在这儿等于"只有规划看得见记忆, 每一步都看不见"。
+                (而 plan()/execute() 收到的 prompt 是**指令模板**, 拿它当检索 query
+                检索不出东西 —— 所以检索仍然用本轮原始输入, 由 RunContext 保证。)
+            agent_id: 身份, 不传就自动生成一个。
         """
-        super().__init__(name, llm, system_prompt, config, memory=memory)
+        super().__init__(name, llm, system_prompt, config, hooks=hooks, agent_id=agent_id)
 
         if custom_prompts:
             planner_prompt = custom_prompts.get("planner")
@@ -218,33 +225,34 @@ class PlanAndSolveAgent(Agent):
         self.planner = Planner(self, planner_prompt)
         self.executor = Executor(self, executor_prompt)
     
-    def run(self, input_text: str, **kwargs) -> str:
+    def _run(self, input_text: str, **kwargs) -> str:
         """
         运行Plan and Solve Agent
-        
+
         Args:
             input_text: 要解决的问题
             **kwargs: 其他参数
-            
+
         Returns:
             最终答案
         """
-        # 【记忆在这里算一次, 不挂基类钩子】
-        # 基类钩子挂在 _build_messages 上, 而这个 Agent 根本不走 _build_messages:
-        # 规划和执行都是自己拼好 prompt 直接 _chat。而且它的 messages[-1] 是
-        # "执行专家, 请只输出当前步骤的答案"这种**指令模板** —— 拿它去检索,
-        # 检索出来的是模板本身, 和用户问题毫无关系。
-        # 所以: 在 run() 里算一次, 显式传进 planner 和 executor。
-        context = self._memory_context(input_text)
+        # 【记忆不在这里, 也不该在这里】
+        # 改造前这一段是: 先 self._memory_context(input_text) 算一次,
+        # 再 context=context 一路传给 planner.plan 和 executor.execute ——
+        # 因为记忆在基类的 _build_messages 里, 而这个 Agent 不走 _build_messages。
+        # 于是"记忆"这个概念被钉进了三个方法的签名里。
+        #
+        # 现在它在 before_llm 的 hook 里, 三个签名都干净了。这个文件从此不知道
+        # 有记忆这回事 —— 想再挂个成本统计/trace, 同样不用回来改它。
 
         # 规划器自己负责带 system(_chat 注入), 这里不再拼消息传进去
-        plan = self.planner.plan(input_text, context=context, **kwargs)
+        plan = self.planner.plan(input_text, **kwargs)
         if not plan:
             final_answer = "无法生成有效的行动计划，任务终止。"
             self._record_turn(input_text, final_answer)
             return final_answer
 
-        final_answer = self.executor.execute(input_text, plan, context=context, **kwargs)
+        final_answer = self.executor.execute(input_text, plan, **kwargs)
 
         #  保存到历史记录 —— 注意记的是"原始问题 -> 最终答案",
         #  中间的 plan 和每一步结果属于任务内部的工作记忆, 不进对话历史。
