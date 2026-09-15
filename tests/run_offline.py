@@ -3,8 +3,9 @@
     conda run -n agent python tests/run_offline.py      (或 D:/anaconda_env/agent/python.exe tests/run_offline.py)
     python tests/run_offline.py -v                      # 把每个用例的名字都打出来
 
-改完记忆层之后的标准动作。全绿说明: 切分、向量库、语义记忆、Agent 接入四层
-都没被改坏 —— 这四层里任何一层错了, 症状都是"检索结果有点怪", 靠肉眼看不出来。
+改完记忆层/框架之后的标准动作。全绿说明: 切分、向量库、语义记忆、情景记忆、
+扩展点(hook)、Agent 接入这几层都没被改坏 —— 其中任何一层错了, 症状都是
+"检索结果有点怪"或者"某个能力偶尔不生效", 靠肉眼都看不出来。
 
 【为什么是子进程而不是 import 进来一起跑】
 每个测试文件都想自己掌控 sys.path(见 _harness.py 开头那个坑), 而且 sqlite 连接、
@@ -34,7 +35,11 @@ SUITES = [
     ("test_chunking.py",      "切分",      "向量库决定多快, 切分决定能不能搜到"),
     ("test_vector_store.py",  "向量库",    "余弦、跨模型拒绝、并发安全"),
     ("test_semantic.py",      "语义记忆",  "批量入库、预算裁剪、分层 fail-open"),
+    ("test_episodic.py",      "情景记忆",  "跨会话 = 跨进程, 以及会话隔离"),
+    ("test_hooks.py",         "扩展点",    "失败策略、注册顺序、流式路径、ctx 生命周期"),
+    ("test_usage.py",         "用量契约",  "usage 藏在空 choices chunk 里、stream_options 可关"),
     ("test_agent_memory.py",  "Agent 接入", "注入点、Turn 不被污染、四个 Agent 各接各的"),
+    ("test_contracts.py",     "契约",      "换任何实现都该成立的性质(框架/应用的分界线)"),
 ]
 
 
