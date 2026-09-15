@@ -33,7 +33,7 @@ from _harness import FakeLLM, TempDir, run_tests, skip          # noqa: E402
 
 from agents0to1.memory.embedding import EmbeddingClient, EmbeddingException   # noqa: E402
 from agents0to1.memory.semantic import SemanticMemory                        # noqa: E402
-from agents0to1 import SimpleAgent                                          # noqa: E402
+from agents0to1 import MemoryHook, SimpleAgent                              # noqa: E402
 
 #: 探测出来的可用客户端。None 表示这个环境跑不了, 原因写在 UNAVAILABLE 里
 CLIENT = None
@@ -245,7 +245,8 @@ def test_agent_injects_really_retrieved_content():
         before = mem.count()
 
         llm = FakeLLM(["好的。"])
-        agent = SimpleAgent("test", llm, system_prompt="你是助手", memory=mem)
+        agent = SimpleAgent("test", llm, system_prompt="你是助手",
+                            hooks=[MemoryHook(mem)])
         agent.run("出差一天最多能报多少钱")
 
         prompt = llm.calls[0]["messages"][-1]["content"]
@@ -294,4 +295,6 @@ if __name__ == "__main__":
     print("  (LLM 那一侧用的是本地假实现, 不产生对话费用)")
     print("=" * 66)
 
-    sys.exit(run_tests(globals(), "联网(真实 embedding)"))
+    # isolate_env=False: 这个文件**就是要**吃 .env 里的真实 key(离线测试才需要隔离)。
+    # 而且上面 probe() 已经拿它建好客户端了, 再清环境只会让"跑不起来"变得更难查。
+    sys.exit(run_tests(globals(), "联网(真实 embedding)", isolate_env=False))

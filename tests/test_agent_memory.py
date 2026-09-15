@@ -508,7 +508,11 @@ def test_snapshot_roundtrip_without_memory():
         agent.run("问题")
         agent.save(path)
 
-        restored = SimpleAgent.load(str(path))
+        # 【必须显式传 llm】不传的话 _from_snapshot 会照着快照里的 provider 建一个
+        # **真**客户端, 而 "fake" 落进 _resolve_credentials 的 else 分支要 LLM_API_KEY,
+        # 于是它去读环境变量 —— 有 .env 的机器上恰好能读到, 这条就"绿"了。
+        # 一颗靠环境变量捂住的红灯, 比一颗红的红灯危险得多: 它只在别人机器上红。
+        restored = SimpleAgent.load(str(path), llm=FakeLLM(["答案"]))
         assert restored.memory is None, "从快照恢复出来的 agent 不该凭空有记忆"
         assert restored.get_turns()[0].user == "问题"
 

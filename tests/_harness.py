@@ -11,12 +11,12 @@
         sys.exit(run_tests(globals(), "向量库"))
 
 【那个必须先解决的坑: import 到的是哪个 agents0to1?】
-本机 `pip install -e` 装的是**原项目**(hand-roll_an_agent), 不是这个副本。
-而 `python tests/test_x.py` 时 sys.path[0] 是 tests/ 目录 —— 于是
-`import agents0to1` 会拿到原项目的包, 你改副本、测原项目, **而且完全不报错**,
+`python tests/test_x.py` 时 sys.path[0] 是 tests/ 目录, 而本机 `pip install -e`
+装的可能是**另一个目录里的** agents0to1(老副本、原项目、site-packages 里的旧版本)。
+于是 `import agents0to1` 会拿到那一份, 你改这里、测那里, **而且完全不报错**,
 只会觉得"我明明改了啊怎么没生效"。
 
-所以 _bootstrap_path() 把副本根目录插到 sys.path 最前面, 保证测的一定是副本。
+所以 _bootstrap_path() 把本仓库根目录插到 sys.path 最前面, 保证测的一定是它。
 """
 
 import copy
@@ -28,25 +28,26 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-#: 副本根目录(本文件在 <根>/tests/_harness.py, 所以往上两级)
+#: 本仓库根目录(本文件在 <根>/tests/_harness.py, 所以往上两级)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _bootstrap_path() -> None:
-    """把副本根目录放到 sys.path 最前面 —— 见模块开头那段说明。"""
+    """把本仓库根目录放到 sys.path 最前面 —— 见模块开头那段说明。"""
     root = str(REPO_ROOT)
     if root in sys.path:
         sys.path.remove(root)
     sys.path.insert(0, root)
 
-    # 顺带把原项目从 sys.path 里挤出去, 免得"副本没改对"时静默用了原项目的代码
-    # (editable 安装的路径会指向 .../hand-roll_an_agent)
-    def _is_original_project(path: str) -> bool:
-        # 只认 ".../hand-roll_an_agent" 结尾的路径 —— 副本叫 ".../hand-roll_an_agent copy",
-        # 结尾对不上, 不会被误伤
-        return path.replace("\\", "/").rstrip("/").endswith("/hand-roll_an_agent")
-
-    sys.path[:] = [p for p in sys.path if p and not _is_original_project(p)]
+    # 这里**不再**按目录名去猜"哪个是别的项目"然后把它挤出去。
+    # 上一版是 `endswith("/hand-roll_an_agent")` —— 而这个仓库自己就叫这个名字,
+    # 于是刚插进去的那条被自己删掉了(实测: REPO_ROOT in sys.path 为 False)。
+    # 它当时没炸, 只是因为 editable 安装的 finder 恰好指向同一个目录兜住了;
+    # 一旦 pip uninstall 或者换台机器, tests/ 和 examples/ 会全线 ModuleNotFoundError,
+    # 而报错完全指不到这里。
+    #
+    # 猜错的代价(静默 import 到别的代码)比不清理大得多, 而 sys.path.insert(0, root)
+    # 已经做到了这段代码真正想要的事: Python 按顺序找, 第一条就是本仓库。
 
 
 _bootstrap_path()
@@ -74,13 +75,31 @@ def skip(reason: str):
     raise SkipTest(reason)
 
 
-def run_tests(namespace: Dict[str, Any], title: str) -> int:
+def run_tests(namespace: Dict[str, Any], title: str, isolate_env: bool = True) -> int:
     """
     跑 namespace 里所有 test_* 函数, 返回进程退出码(0 = 全过)。
 
     namespace 一般直接传 globals()。只收本模块自己定义的函数 ——
     否则会把 import 进来的 test_ 函数也跑一遍(然后跑两遍)。
+
+    isolate_env: 跑之前把 .env 带进来的 API key 清掉(默认开)。见下面的说明。
     """
+    if isolate_env:
+        # 离线测试不许吃 .env —— 否则"不依赖 API key"这条保证会被**静默**破坏。
+        #
+        # 已经真实发生过一次: test_snapshot_roundtrip_without_memory 里没传 llm=,
+        # 基类于是拿 provider="fake" 去 _resolve_credentials, 落到 else 分支要 LLM_API_KEY,
+        # 而 agents0to1/__init__.py 的 find_dotenv(usecwd=True) 从仓库根**往上找**,
+        # 捡到了上一级的 Desktop/Agent/.env —— 于是它"通过"了, 在一台有 .env 的机器上。
+        # 换台机器/换个目录跑就红。**一颗靠环境变量捂住的红灯, 比一颗红的红灯危险得多。**
+        for name in (
+            "LLM_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ZHIPU_API_KEY",
+            "GLM_API_KEY", "DASHSCOPE_API_KEY", "MODELSCOPE_API_KEY",
+            "KIMI_API_KEY", "MOONSHOT_API_KEY",
+            "EMBEDDING_API_KEY", "LLM_BASE_URL",
+        ):
+            os.environ.pop(name, None)
+
     module_name = namespace.get("__name__")
     cases = [
         (name, obj)
