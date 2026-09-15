@@ -3,6 +3,12 @@
 .env.local
 *.key
 
+# 记忆层默认落盘位置(相对 CWD) —— 向量库和对话记录不该进版本库
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
 # Python
 __pycache__/
 *.py[cod]
