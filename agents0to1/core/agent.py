@@ -28,7 +28,8 @@ class Agent(ABC):
             name: str,
             llm: Agents0to1,
             system_prompt: Optional[str] = None,
-            config: Optional[Config] = None
+            config: Optional[Config] = None,
+            memory: Optional[object] = None
             ):
         self.config = config or Config()
         self.name = name
@@ -40,6 +41,23 @@ class Agent(ABC):
         # 最近一次【流式】调用的完整响应。存在 Agent 上而不是只读 llm.last_response:
         # 同一个 llm 客户端可能被多个 Agent 共用(llm.last_response 里放的是"最后一次流式调用"的结果, 不区分是哪个 Agent 发起的), 存一份在自己的属性上才不会串台。
         self._last_response: Optional[LLMResponse] = None
+
+        # ==================== 记忆 ====================
+        #
+        # 四个子类都是用**位置参数**调 super().__init__(name, llm, system_prompt, config)
+        # 要是把 memory 插在 config 前面, 所有位置调用会把 config 静默绑到 memory上又是一个不报错的错误。
+        #
+        # 【类型守卫】memory 的合法形状:
+        #     search()        —— 语义记忆, 按相似度检索
+        #     build_context() —— 情景记忆, 按时间回放 (它没有 search)
+        if memory is not None and not (
+            hasattr(memory, "search") or hasattr(memory, "build_context")
+        ):
+            raise TypeError(
+                f"memory 需要提供 search() 或 build_context() 方法, "
+                f"收到的是 {type(memory).__name__}"
+            )
+        self.memory = memory
 
     #声明必须实现这个方法！！
     @abstractmethod
@@ -79,13 +97,60 @@ class Agent(ABC):
 
     def _build_messages(self, input_text: str) -> list[dict]:
         """
-        拼入口消息: system + 历史 + 当前问题。
+        拼入口消息: system + 历史 + 当前问题(有记忆时, 检索结果并进这条 user 里)。
         """
         return (
             self._base_messages()
             + self._history_messages()
-            + [{"role": "user", "content": input_text}]
+            + [self._prepare_user_message(input_text)]
         )
+
+    # ==================== 记忆注入 ====================
+
+    def _prepare_user_message(self, input_text: str) -> dict:
+        """
+        组装最后那条 user 消息。有记忆时把检索结果**并进同一条消息**。
+        """
+        message = {"role": "user", "content": input_text}
+        if self.memory is None:
+            return message
+
+        context = self._memory_context(input_text)
+        if not context:
+            return message
+        return {"role": "user", "content": f"{context}\n\n{input_text}"}
+
+    def _record_first_message(self, input_text: str) -> dict:
+        """
+        进 Turn 的第一条消息  必须是原始输入。
+        _prepare_user_message 把检索结果并进了这条 user 消息, 但那份内容只该活在
+        """
+        return {"role": "user", "content": input_text}
+
+    def _memory_context(self, query: str) -> str:
+        """
+        取记忆上下文。**fail-open 兜底: 任何异常都退化成"没有记忆"。**
+        """
+        if self.memory is None:
+            return ""
+
+        try:
+            build = getattr(self.memory, "build_context", None)
+            if callable(build):
+                return build(query) or ""
+
+            # 只提供 search() 的记忆对象: 由 agent 负责排版,
+            # 这样它和 KnowledgeSearchTool 走的是同一个 format_items, 形状一致
+            items = self.memory.search(query)
+            if not items:
+                return ""
+            format_items = getattr(self.memory, "format_items", None)
+            if callable(format_items):
+                return format_items(items)
+            return "\n\n".join(f"[{i}] {item.text}" for i, item in enumerate(items, 1))
+        except Exception as e:
+            logger.warning("记忆检索失败, 本轮按『没有记忆』继续: %s", e)
+            return ""
 
     def _ensure_system(self, messages: list[dict]) -> list[dict]:
         """
@@ -284,6 +349,17 @@ class Agent(ABC):
     # 下面几处类型注解用的是 PEP 604 的 str | Path, 这是 3.10 的语法。
     # 函数注解在 def 执行时求值, 所以 3.9 上 import 这个模块会直接 TypeError。
     # pyproject 里的 requires-python 已经同步成 ">=3.10", 两边别改岔了。
+    #
+    # 【memory **不进**快照, 这是明确的设计】
+    # snapshot() 用的是 json.dumps(..., default=str)。一个活的向量库句柄塞进去,
+    # 会被**静默序列化**成 "<memory.semantic.SemanticMemory object at 0x...>"
+    # 这样一串字符串 —— 不报错。然后 _from_snapshot 的 setdefault 会把这串
+    # 字符串喂给构造函数, 直到第一次调 LLM 才炸, 报错位置离病因十万八千里。
+    #
+    # 所以: 想让恢复出来的 agent 也带记忆, 显式传 ——
+    #     SemanticMemory.load(...) 是不存在的, 直接:
+    #     ReActAgent.load("s.json", tool_registry=r, memory=mem)
+    # 靠现有的 setdefault 机制**天然就支持覆盖**, 不用额外写代码。
     #
 
     SNAPSHOT_VERSION = 1

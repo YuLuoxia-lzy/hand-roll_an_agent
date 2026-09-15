@@ -51,7 +51,8 @@ class ReActAgent(Agent):
         system_prompt: Optional[str] = None,
         config: Optional[Config] = None,
         max_steps: int = 5,
-        custom_prompt: Optional[str] = None
+        custom_prompt: Optional[str] = None,
+        memory: Optional[object] = None
     ):
         """
         初始化ReActAgent
@@ -64,8 +65,11 @@ class ReActAgent(Agent):
             config: 配置对象
             max_steps: 最大执行步数(循环上限, 防止模型反复调工具停不下来)
             custom_prompt: 自定义工作方式说明(覆盖 DEFAULT_REACT_PROMPT)
+            memory: 记忆对象(SemanticMemory / EpisodicMemory 等)。
+                    它注入到最后那条 user 消息里, **不进 Turn** ——
+                    所以历史、快照、下一轮请求都不会带上检索结果。
         """
-        super().__init__(name, llm, system_prompt, config)
+        super().__init__(name, llm, system_prompt, config, memory=memory)
         self.tool_registry = tool_registry
         self.max_steps = max_steps
         self.prompt_template = custom_prompt if custom_prompt else DEFAULT_REACT_PROMPT
@@ -230,9 +234,20 @@ class ReActAgent(Agent):
     def _finish(self, input_text: str, final_answer: str, messages: List[dict], turn_start: int) -> str:
         """
         收尾: 记录轨迹与对话历史, 返回答案。
+
+        【记之前必须把第一条还原成原始输入】
+        messages[turn_start] 就是 _build_messages 产出的那条 user 消息 —— 有记忆时
+        它带着本轮的检索结果(core/agent.py:_prepare_user_message)。检索结果只该活
+        在这一轮的请求里, 存进 Turn 的话下一轮会被当成"用户说过的话"重发, 而
+        _turn_chars 的预算也会被它白吃。见 _record_first_message()。
         """
         self.last_messages = messages
-        self._record_turn(input_text, final_answer, messages=messages[turn_start:])
+
+        recorded = list(messages[turn_start:])
+        if recorded and recorded[0].get("role") == "user":
+            recorded[0] = self._record_first_message(input_text)
+
+        self._record_turn(input_text, final_answer, messages=recorded)
         return final_answer
 
 

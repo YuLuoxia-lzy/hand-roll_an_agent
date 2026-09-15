@@ -8,6 +8,8 @@ from .registry import ToolRegistry, global_registry
 # 那个 import 已经修好, 所以这里可以放开了。
 from .builtin.search import SearchTool
 from .builtin.calculator import CalculatorTool
+# 知识检索工具: 需要自己传一个 SemanticMemory 进来, 所以不在 builtin 里自动实例化
+from .builtin.knowledge import KnowledgeSearchTool
 
 # 高级功能
 # 注意: 旧的 create_research_chain / create_simple_chain 已废弃(写死了不存在的工具名),
@@ -30,6 +32,7 @@ __all__ = [
     # 内置工具
     "SearchTool",
     "CalculatorTool",
+    "KnowledgeSearchTool",
 
     # 工具链功能
     "ToolChain",

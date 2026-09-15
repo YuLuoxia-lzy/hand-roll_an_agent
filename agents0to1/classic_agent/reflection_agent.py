@@ -43,9 +43,9 @@ DEFAULT_PROMPTS = {
 """
 }
 
-class Memory:
+class Scratchpad:
     """
-    简单的短期记忆模块，用于存储智能体的行动与反思轨迹。
+    
     """
     def __init__(self):
         self.records: List[Dict[str, Any]] = []
@@ -92,15 +92,16 @@ class ReflectionAgent(Agent):
     def __init__(
         self,
         name: str,
-        llm: Agents0to1, 
+        llm: Agents0to1,
         system_prompt: Optional[str] = None,
         config: Optional[Config] = None,
         max_iterations: int = 3,
-        custom_prompt: Optional[Dict[str, str]] = None
+        custom_prompt: Optional[Dict[str, str]] = None,
+        memory: Optional[object] = None
     ):
-        super().__init__(name, llm, system_prompt, config)
+        super().__init__(name, llm, system_prompt, config, memory=memory)
         self.max_iterations = max_iterations
-        self.memory = Memory()
+        self.scratch = Scratchpad()
         self.custom_prompt = custom_prompt if custom_prompt else DEFAULT_PROMPTS
 
     def run(self, input_text: str, **kwargs) -> str:
@@ -114,19 +115,32 @@ class ReflectionAgent(Agent):
         Returns:
             最终优化后的结果(str —— 与基类 Agent.run 的签名保持一致)
         """
-        self.memory = Memory() #短期记忆
+        self.scratch = Scratchpad() #本轮草稿轨迹, 每次 run 重来
+
+        # 【记忆只喂给**初稿**, 不喂给评审和改写】
+        # 为什么: 这个 Agent 的 messages[-1] 是"模型自己的草稿/评审意见",
+        # 不是用户问题。拿它去检索, 检索出来的东西和被检索的内容毫无关系。
+        # 而且只喂初稿还有第二层理由 —— 后面几轮喂了也没用:
+        # 检索结果会混进评审意见里, 变成"记忆在评自己", 越评越偏。
+        #
+        # 这个 Agent 不走 _build_messages(它直接用 _chat), 所以基类的钩子
+        # 对它不生效 —— 必须在 run() 里显式算一次。
+        context = self._memory_context(input_text)
+
         initial_prompt = self.custom_prompt["initial"].format(task=input_text)
+        if context:
+            initial_prompt = f"{context}\n\n{initial_prompt}"
         initial_result = self._get_llm_response(initial_prompt, **kwargs)
-        self.memory.add_record("execution", initial_result)
+        self.scratch.add_record("execution", initial_result)
 
         for i in range(self.max_iterations):
-            last_result = self.memory.get_last_execution()
+            last_result = self.scratch.get_last_execution()
             reflect_prompt = self.custom_prompt["reflect"].format(
                 task = input_text,
                 content = last_result
-            )        
+            )
             feedback = self._get_llm_response(reflect_prompt, **kwargs)
-            self.memory.add_record("reflection", feedback)
+            self.scratch.add_record("reflection", feedback)
 
             logger.info("第 %d 轮评审反馈: %s", i + 1, feedback)
 
@@ -141,9 +155,9 @@ class ReflectionAgent(Agent):
             )
 
             refine_result = self._get_llm_response(refine_prompt, **kwargs)
-            self.memory.add_record("execution", refine_result)
-        
-        final_result = self.memory.get_last_execution()
+            self.scratch.add_record("execution", refine_result)
+
+        final_result = self.scratch.get_last_execution()
 
         self._record_turn(input_text, final_result or "")
 

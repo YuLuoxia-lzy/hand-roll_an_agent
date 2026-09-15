@@ -20,6 +20,17 @@ class ToolException(Agents0to1Exception):
     """工具相关异常"""
     pass
 
+class EmbeddingException(Agents0to1Exception):
+    """Embedding 相关异常"""
+
+class VectorStoreException(Agents0to1Exception):
+    """向量库相关异常"""
+
+class SemanticMemoryException(Agents0to1Exception):
+    """语义记忆相关异常"""
+
+class EpisodicMemoryException(Agents0to1Exception):
+    """情景记忆相关异常"""
 
 configException = ConfigException
 

@@ -15,10 +15,12 @@ class SimpleAgent(Agent):
         name: str,
         llm: Agents0to1,
         system_prompt: Optional[str] = None,
-        config: Optional[Config] = None
+        config: Optional[Config] = None,
+        memory: Optional[object] = None
     ):
         #运行目标函数的init的具体方法 可以自己补充
-        super().__init__(name, llm, system_prompt, config)
+        # memory 只能**关键字**传进基类: 前面四个是位置参数, 顺序不能动(见 core/agent.py 的说明)
+        super().__init__(name, llm, system_prompt, config, memory=memory)
 
     def run(self, input_text: str, **kwargs) -> str:
         """
