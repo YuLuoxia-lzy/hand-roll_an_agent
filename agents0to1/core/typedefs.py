@@ -14,10 +14,52 @@ class ToolCall:
     arguments: dict  # 参数: 解析成字典
 
 @dataclass
+class Usage:
+    """
+    一次 LLM 调用的用量。**成本、预算、熔断、可观测性, 四件事的共同地基。**
+
+    【为什么 None 和 0 是两回事】
+    LLMResponse.usage 为 None 表示"这次没拿到用量"(服务不返回 / 流式没开
+    include_usage), 而 Usage(0,0,0) 表示"拿到了, 就是 0"。
+    把它们合成一个, 就没法区分"没统计"和"统计下来是零" —— 前者的正确反应是
+    去开 include_usage, 后者的正确反应是什么都不用做。
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def __add__(self, other: "Usage") -> "Usage":
+        """累加 —— 一次 run() 里可能调很多次 LLM, 你最终想知道的是总数。
+
+        hook 里最顺手的用法(见 after_llm):
+            ctx.state["usage"] = ctx.state.get("usage", Usage()) + response.usage
+        """
+        return Usage(
+            self.prompt_tokens + other.prompt_tokens,
+            self.completion_tokens + other.completion_tokens,
+            self.total_tokens + other.total_tokens,
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"prompt={self.prompt_tokens} completion={self.completion_tokens} "
+            f"total={self.total_tokens}"
+        )
+
+
+@dataclass
 class LLMResponse:
     """大模型回应所需格式"""
     content: Optional[str] = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    #: 这次调用的用量。**拿不到就是 None, 不要编造 0** —— 见 Usage 的说明
+    usage: Optional[Usage] = None
+    #: 实际服务的模型名。可能和请求的不一样(服务端路由/降级), 排查时很有用
+    model: Optional[str] = None
+    #: "stop" / "tool_calls" / "length" —— 被 max_tokens 截断时是 "length",
+    #: 那意味着"答案不完整", 不是"模型不想说了"
+    finish_reason: Optional[str] = None
 
     @property
     def has_tool_calls(self) -> bool:
