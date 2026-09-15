@@ -276,7 +276,9 @@ class VectorStore:
 
         if model is not None and stored_models and model not in stored_models:
             raise VectorStoreException(
-                f"库里的向量来自 {stored_models}, 这次查询用的是 '{model}'。"
+                f"跨模型的向量不可比：库里的向量来自 {stored_models}，"
+                f"这次查询用的是 '{model}'。请换用产生这些向量的同一个模型来查询，"
+                f"或者把这批向量重新灌一遍。"
             )
         if dim is not None and stored_dims and dim not in stored_dims:
             raise VectorStoreException(
