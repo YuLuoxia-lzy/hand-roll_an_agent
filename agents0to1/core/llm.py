@@ -6,7 +6,7 @@ from typing import Literal, Optional, Iterator
 from openai import OpenAI
 
 from .exceptions import *
-from .typedefs import LLMResponse, ToolCall, parse_tool_calls, safe_parse_arguments
+from .typedefs import LLMResponse, ToolCall, Usage, parse_tool_calls, safe_parse_arguments
 from .config import Config
 
 # 各模块自己 getLogger(__name__)
@@ -28,6 +28,31 @@ _ENV_PROVIDER_KEYS = (
     ("ollama", ("OLLAMA_API_KEY", "OLLAMA_HOST")),
     ("vllm", ("VLLM_API_KEY", "VLLM_HOST")),
 )
+
+def _to_usage(raw) -> Optional[Usage]:
+    """
+    把 SDK 的 usage 对象转成框架自己的 Usage。
+
+    **拿不到就返回 None, 不编造 Usage(0,0,0)** —— 见 Usage 的说明:
+    "没统计到"和"统计下来是零"要能区分开, 否则可观测性就没有意义。
+
+    用 getattr 取字段而不是直接点属性: 不同 OpenAI 兼容服务的 usage 对象
+    字段不完全一样(有的没有 total_tokens), 少一个字段不该把整轮调用带崩。
+    """
+    if raw is None:
+        return None
+    return Usage(
+        prompt_tokens=getattr(raw, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(raw, "completion_tokens", 0) or 0,
+        total_tokens=getattr(raw, "total_tokens", 0) or 0,
+    )
+
+
+def _first_choice(response):
+    """取第一个 choice, 没有就返回 None —— 不靠调用方各自 try"""
+    choices = getattr(response, "choices", None)
+    return choices[0] if choices else None
+
 
 class Agents0to1:
     """
@@ -335,6 +360,12 @@ class Agents0to1:
 
         if stream:
             params["stream"] = True
+            # 让流式响应也带上 usage —— OpenAI 兼容接口默认**不在流里返回**它。
+            #
+            # ⚠️ 不是所有服务都认这个字段(一些自建 / 老版本 vLLM 会直接 400),
+            # 所以做成可关的: LLM_STREAM_USAGE=false
+            if os.getenv("LLM_STREAM_USAGE", "true").strip().lower() == "true":
+                params["stream_options"] = {"include_usage": True}
 
         # 其余参数(seed、tool_choice、response_format 等)原样透传, 同样过滤掉 None
         params.update({k: v for k, v in kwargs.items() if v is not None})
@@ -348,10 +379,14 @@ class Agents0to1:
         try:
             params = self._build_request_params(messages, tools=tools, **kwargs)
             response = self._client.chat.completions.create(**params)  #调用api 配置参数 得到回答
-            message = response.choices[0].message
+            choice = _first_choice(response)
+            message = choice.message
             return LLMResponse(
                 content=message.content,
-                tool_calls=parse_tool_calls(message.tool_calls)
+                tool_calls=parse_tool_calls(message.tool_calls),
+                usage=_to_usage(getattr(response, "usage", None)),
+                model=getattr(response, "model", None),
+                finish_reason=getattr(choice, "finish_reason", None),
             ) #输出模型回答的 第一个内容 一般只有一个
         except Exception as e:
             logger.exception("LLM调用失败: %s", e)
@@ -375,11 +410,28 @@ class Agents0to1:
             response = self._client.chat.completions.create(**params)
 
             last_key = None
+            stream_usage = None      # 只有开了 include_usage 才会有
+            stream_model = None
+            finish_reason = None
             for chunk in response:
+                # ⚠️ usage 必须在 `continue` **之前**取出来。
+                # 开了 include_usage 之后, **最后一个 chunk 的 choices 是空数组**
+                # (只有 usage, 没有 delta)—— 放在 continue 后面就永远拿不到它,
+                # 而且是静默的: 不报错, 只是 usage 一直是 None。
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    stream_usage = chunk_usage
+                if stream_model is None:
+                    stream_model = getattr(chunk, "model", None)
+
                 if not chunk.choices:
                     continue
 
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                delta = choice.delta
                 if delta.content:
                     content_parts.append(delta.content)
                     yield delta.content
@@ -413,7 +465,10 @@ class Agents0to1:
                         arguments=self._parse_stream_arguments(p["arguments"], p["name"]),
                     )
                     for p in tool_parts.values()
-                ]
+                ],
+                usage=_to_usage(stream_usage),
+                model=stream_model,
+                finish_reason=finish_reason,
             )
 
         except Exception as e:
