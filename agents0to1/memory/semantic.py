@@ -2,7 +2,8 @@
 语义记忆 —— 切分 + 入库 + 检索
 
 切分的基本要求:
-  - 按**句子边界**切, 不要在句子中间断开。中文按 。！？ 和换行切
+  - 按**句子边界**切, 不要在句子中间断开。中文按 。！？ 和换行切,
+    英文按 .!? 切(ASCII 的 '.' 有守卫, 不会把 3.14 切开)。
   - 有 **overlap**(相邻块重叠一部分), 否则答案正好落在边界上就丢了
   - 带 **metadata**(来源、位置), 否则检索回来你不知道它从哪来, 也没法引用
 
@@ -47,8 +48,30 @@ class MemoryItem(BaseModel):
 
 # ==================== 切分 ====================
 
-#: 句子结束符。中文的 。！？ , 英文的 .!?          换行。
+#: 句子结束符。中文的 。！？；;… 、英文的 !? 和换行。
+#: ASCII 的 '.' 不在这里 —— 它是有条件的边界, 见 _is_sentence_end。
 _SENTENCE_END = "。！？!?；;…\n"
+
+
+def _is_sentence_end(text: str, i: int) -> bool:
+    """
+    text[i] 是不是一个句子边界。
+
+    【为什么 '.' 不能直接塞进 _SENTENCE_END】
+    上面那行注释一直写着"英文的 .!?", 而实现里从来没有 '.', 于是纯英文文档
+    永远切不开 —— 一整篇会被当成**一句话**, 要么挤成一块, 要么被 _hard_split
+    从中间硬切。但直接把 '.' 加进集合里同样不行:
+        3.14  ->  "3." 和 "14"     v1.2.3 / file.txt / U.S.A. 同理
+    所以 '.' 只在**后面跟着空白或者到头**时才算句末 —— 这是英文排版的常识
+    ("one. Two" 点后有空格), 顺手也把小数和缩写放过去了。
+    """
+    ch = text[i]
+    if ch in _SENTENCE_END:
+        return True
+    if ch == ".":
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        return not nxt or nxt.isspace()
+    return False
 
 
 def split_sentences(text: str) -> List[str]:
@@ -60,7 +83,7 @@ def split_sentences(text: str) -> List[str]:
     buf: List[str] = []
     for i, ch in enumerate(text):
         buf.append(ch)
-        if ch in _SENTENCE_END:
+        if _is_sentence_end(text, i):
             nxt = text[i + 1] if i + 1 < len(text) else ""
             if nxt and nxt in _SENTENCE_END:
                 continue            # 后面还跟着结束符, 等最后一个
@@ -85,7 +108,9 @@ def _overlap_tail(text: str, target: int) -> str:
     minimum = max(1, int(target * 0.4))
 
     for i, ch in enumerate(tail):
-        if ch in _SENTENCE_END and len(tail) - (i + 1) >= minimum:
+        # 判据和 split_sentences 同一份 —— 两处若各写一套, overlap 的切点
+        # 迟早会落在 split_sentences 不认的位置上, 而那种错不报任何异常
+        if _is_sentence_end(tail, i) and len(tail) - (i + 1) >= minimum:
             return tail[i + 1:].lstrip()
 
     return tail
@@ -274,6 +299,15 @@ class SemanticMemory:
         """
         return self.index_texts([text], [metadata or {}])
 
+    def _load_file(self, path: str) -> str:
+        """读一个文本文件。ingest_file 和 reindex_file 共用这一份 —— 两条路径
+        各写一遍的话, "文件不存在时报什么"和"用什么编码"迟早会不一致。"""
+        path = str(path)
+        if not os.path.isfile(path):
+            raise SemanticMemoryException(f"文件不存在: {path}")
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
     def ingest_file(self, path: str, metadata: Optional[Dict[str, Any]] = None) -> int:
         """
         读文件 -> 切分 -> 批量入库。只处理纯文本和 markdown。
@@ -281,34 +315,35 @@ class SemanticMemory:
         Returns:
             实际入库的块数
         """
-        path = str(path)
-        if not os.path.isfile(path):
-            raise SemanticMemoryException(f"文件不存在: {path}")
+        content = self._load_file(path)
 
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-
-        meta = {"source": os.path.basename(path), "path": path}
+        meta = {"source": os.path.basename(str(path)), "path": str(path)}
         meta.update(metadata or {})
         return self.index_texts([content], [meta])
 
-    def index_texts(
+    def _prepare_chunks(
         self,
         texts: Sequence[str],
-        metadatas: Optional[Sequence[Dict[str, Any]]] = None,
-    ) -> int:
+        metas: Sequence[Dict[str, Any]],
+    ) -> tuple:
         """
-        批量入库(会被切分)。embedding 请求按 batch_size 攒批发 ——
-        """
-        metas = list(metadatas) if metadatas is not None else [{} for _ in texts]
+        切分 + 补元数据。**不联网、不碰库** —— 它失败的时候, 库还是原样。
 
+        (reindex_file 就靠这条性质做到"先算新的, 再删旧的"。)
+
+        Returns:
+            (chunks, metas, used) —— used 是**真的产出过块**的文本段数。
+            它和 len(texts) 的差, 就是被空白段吃掉的那部分。
+        """
         all_chunks: List[str] = []
         all_meta: List[Dict[str, Any]] = []
+        used = 0
 
         for text, meta in zip(texts, metas):
             chunks = chunk_text(text, chunk_size=self.chunk_size, overlap=self.overlap)
             if not chunks:
                 continue
+            used += 1
             # 记位置: 没有它, 检索回来你既不知道它从哪来, 也没法引用
             for i, chunk in enumerate(chunks):
                 all_chunks.append(chunk)
@@ -319,15 +354,50 @@ class SemanticMemory:
                     "chunk_total": len(chunks),
                     "ingested_at": time.time(),
                 })
+        return all_chunks, all_meta, used
+
+    def _embed_and_add(self, chunks, metas, vectors=None) -> int:
+        """算向量 -> 入库。vectors 已经算好就传进来(见 reindex_file)。"""
+        if not chunks:
+            return 0
+        if vectors is None:
+            vectors = self.embedder.embed(chunks)       # 内部自动攒批
+        self.store.add(chunks, vectors, metas, model=self.embedder_id)
+        return len(chunks)
+
+    def index_texts(
+        self,
+        texts: Sequence[str],
+        metadatas: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> int:
+        """
+        批量入库(会被切分)。embedding 请求按 batch_size 攒批发 ——
+        """
+        texts = list(texts)
+        metas = list(metadatas) if metadatas is not None else [{} for _ in texts]
+
+        # 【长度必须自己校验, 不能靠 zip 兜底】
+        # zip 是**静默**按短的截断的: 传 10 段文本 + 3 份元数据, 后 7 段
+        # 就这么消失了, 一句日志都没有, 而且 count() 看起来完全正常。
+        # 文档系统里"入库成功但搜不到"最难查的一种, 就是它。
+        if len(metas) != len(texts):
+            raise SemanticMemoryException(
+                f"texts 和 metadatas 长度必须一致: {len(texts)} != {len(metas)}。"
+                f"zip() 会把多出来的那段**静默丢掉**, 所以这里直接报错。"
+            )
+
+        all_chunks, all_meta, used = self._prepare_chunks(texts, metas)
 
         if not all_chunks:
             logger.warning("没有可入库的内容(全是空白?), 已跳过。")
             return 0
 
-        vectors = self.embedder.embed(all_chunks)       # 内部自动攒批
-        self.store.add(all_chunks, vectors, all_meta, model=self.embedder_id)
-        logger.info("已入库 %d 块 (来自 %d 段文本)", len(all_chunks), len(texts))
-        return len(all_chunks)
+        n = self._embed_and_add(all_chunks, all_meta)
+        # 报 used 而不是 len(texts): 原来那句日志会把空白段也算进去,
+        # "10 段文本入库成功"和"其实只有 3 段有内容"读起来一模一样。
+        logger.info("已入库 %d 块 (来自 %d 段文本, 跳过 %d 段空白)",
+                    n, used, len(texts) - used)
+        return n
 
     # ==================== 遗忘 / 增量入库 ====================
     #
@@ -349,18 +419,44 @@ class SemanticMemory:
 
     def reindex_file(self, path: str, metadata: Optional[dict] = None) -> int:
         """
-        重新入库一个文件: **先按 source 删掉旧的, 再灌新的**。
+        重新入库一个文件: **先算新的, 再删旧的, 最后写入**。
 
         这才是"增量入库"。没有 delete 就做不了它 —— 每次改动都得全量重建,
         而全量重建会把库里的其他来源一起清掉。
+
+        【为什么不是"先删旧的再灌新的"(初版就是这个顺序)】
+        那个顺序下, 删除和写入之间夹着两次网络往返(embedding 请求 + 可能的
+        重试)。中间任何一步失败 —— 断网、配额用完、进程被杀 —— 旧数据**已经
+        删了**、新数据没进来, 这份文件就永久查不到了, 而且**不报任何错**:
+        调用方拿到一个异常, 库里的东西却少了。文档系统里这是最坏的一种:
+        你以为在"更新一份文档", 实际在"删掉一份文档"。
+        现在的顺序里, 只有 forget 和 add 两个本地 SQLite 操作挨着, 中间的
+        窗口小到可以忽略; 而且 embedding 失败时库**原封不动**。
 
         ⚠️ 同一份文件重复 ingest_file() 会**重复入库**(见 episodic.py 里同款的坑):
         chunks 是按 source+chunk_index 记的, 但没有任何去重, 检索时同一段内容
         会出现 N 次。要更新一个文件就调这个, 不要重复调 ingest_file()。
         """
         source = os.path.basename(str(path))
+        content = self._load_file(path)
+
+        meta = {"source": source, "path": str(path)}
+        meta.update(metadata or {})
+        chunks, metas, _ = self._prepare_chunks([content], [meta])
+
+        # 先把向量算出来 —— 这一步会抛(网络/配额), 而那时旧数据还在库里
+        vectors = self.embedder.embed(chunks) if chunks else []
+
         self.forget({"source": source})
-        return self.ingest_file(path, metadata)
+        if not chunks:
+            # 文件被清空了: 删掉旧数据是对的(内容确实没了), 但要留一条日志 ——
+            # 否则"我更新了一个空文件"和"我误删了整个 source"在日志里长得一样
+            logger.warning("重新入库 %s: 文件里没有可入库的内容, 旧数据已清空。", source)
+            return 0
+
+        n = self._embed_and_add(chunks, metas, vectors)
+        logger.info("已重新入库 %s: %d 块", source, n)
+        return n
 
     # ==================== 检索 ====================
 

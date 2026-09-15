@@ -16,6 +16,11 @@ class CalculatorTool(Tool):
     # 乘方护栏: 指数绝对值超过这个数就拒绝计算。
     MAX_EXPONENT = 1000
 
+    # run() 里**故意的**不抛异常(见下面那段说明), 失败也是一句普通字符串。
+    # 声明出来, 工具链 / registry 才知道"计算失败: ..."其实是失败 ——
+    # 不然链会拿着一个错值继续往下算。
+    error_prefixes = ("错误", "计算失败")
+
     # 支持的操作符
     OPERATORS = {
         ast.Add: operator.add,

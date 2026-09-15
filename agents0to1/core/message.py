@@ -90,30 +90,3 @@ class Turn(BaseModel):
             else:
                 i += 1
         return True
-
-
-
-# if __name__ == "__main__":
-#     # 合法：assistant 声明 2 个 tool_call，后面跟 2 条对应 tool
-#     ok = [
-#         {"role": "user", "content": "查北京和上海天气"},
-#         {"role": "assistant", "tool_calls": [
-#             {"id": "c1", "type": "function", "function": {"name": "weather", "arguments": "{}"}},
-#             {"id": "c2", "type": "function", "function": {"name": "weather", "arguments": "{}"}},
-#         ]},
-#         {"role": "tool", "tool_call_id": "c1", "content": "晴"},
-#         {"role": "tool", "tool_call_id": "c2", "content": "雨"},
-#         {"role": "assistant", "content": "北京晴，上海雨"},
-#     ]
-#     assert Turn(user="x", messages=ok).is_valid() is True
-
-#     # 非法：少了一条 tool
-#     bad = ok[:3]
-#     assert Turn(user="x", messages=bad).is_valid() is False
-
-#     # 非法：id 对不上
-#     bad2 = [
-#         {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
-#         {"role": "tool", "tool_call_id": "WRONG", "content": "x"},
-#     ]
-#     assert Turn(user="x", messages=bad2).is_valid() is False

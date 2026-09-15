@@ -22,6 +22,22 @@ class Tool(ABC):
     # 截断保留的尾部长度: 结论、报错、命令输出常常在末尾, 只砍尾巴会丢掉最有用的部分
     _TAIL_CHARS: int = 800
 
+    #: 工具**自己吞掉异常**、把失败当成正常结果返回时, 结果会以这些前缀开头。
+    #:
+    #: 大多数工具不应该用到它 —— 出错了直接 raise 更干净, registry 会接住并
+    #: 标记成失败。但有些工具是**故意**不抛的: 计算器就是这么设计的,
+    #: "计算失败: division by zero" 会作为工具结果回传给模型, 让模型自己改
+    #: 表达式重试(见 calculator.py 里那段说明)。
+    #:
+    #: 这种情况下 registry 只看得到一个字符串, 它无从判断这是成功还是失败 ——
+    #: 而**猜**别的前缀是不行的: 换个工具完全可能返回一段以"错误"开头的正文
+    #: (比如检索到的一段报错日志)。所以由工具自己声明自己的失败词汇。
+    error_prefixes: tuple = ()
+
+    def looks_like_error(self, text: str) -> bool:
+        """返回值是不是"工具自己吞掉的那个失败"(见 error_prefixes)。"""
+        return bool(self.error_prefixes) and isinstance(text, str) and text.startswith(self.error_prefixes)
+
     def __init__(self, name: str, description: str):
         self.name = name
         self.description = description

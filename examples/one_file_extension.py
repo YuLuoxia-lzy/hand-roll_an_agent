@@ -23,7 +23,7 @@
 
 【⚠️ 别把这里的东西抄进框架】
     本文件里的每一个类都属于**应用层**。框架只保证"挂得上", 不保证"替你挂"。
-    (见 docs/extension-map.md 第四节)
+    (见本地笔记 docs/extension-map.md 第四节)
 """
 
 import sys

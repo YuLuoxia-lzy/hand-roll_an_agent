@@ -64,49 +64,54 @@ class ToolRegistry:
         Returns:
             工具执行结果字符串。失败时返回"错误: xxx"而不是抛异常 ——
             因为返回值会作为 tool 消息回传给模型, 模型看到错误能自己换个参数重试。
+
+        需要知道"这次到底成功没有"的调用方(比如工具链)请用 execute_with_status,
+        **别去读返回值的前缀** —— 见那个方法的说明。
         """
+        return self._execute(call)[0]
+
+    def execute_with_status(self, call: ToolCall) -> tuple:
+        """
+        和 execute() 一样, 但额外告诉你成功还是失败。返回 (结果, ok)。
+
+        【为什么必须多这一个方法, 而不是让调用方 startswith("错误")】
+        前缀是**内容**, 不是协议。拿它当判据两头都会错:
+          - 假失败: 工具本来就可能返回一段以"错误"开头的正文(检索到的报错日志、
+                    一段讲错误处理的文档)。链会就此中断, 而那次调用明明是成功的。
+          - 假成功: 计算器失败时返回 "计算失败: division by zero" —— 不匹配前缀。
+                    链会拿着这个字符串当结果继续往下跑, 把错值喂给下一步,
+                    最后交出一个**看起来算过、其实基于垃圾**的答案。
+        所以判断只能来自执行路径本身, 不能来自读结果。工具自己吞掉异常的那些
+        (计算器就是), 由它声明 error_prefixes —— 见 tools/base.py。
+        """
+        return self._execute(call)
+
+    def _execute(self, call: ToolCall) -> tuple:
+        """execute / execute_with_status 的唯一实现 —— 判定逻辑只能有一份。"""
         tool = self._tools.get(call.name)
         if tool is None:
             available = ", ".join(self._tools.keys()) or "无"
-            return f"错误:未找到名为 '{call.name}' 的工具。可用工具: {available}"
+            return f"错误:未找到名为 '{call.name}' 的工具。可用工具: {available}", False
 
         # 参数校验: 缺参数时不执行, 直接把"缺什么"告诉模型
         error = tool.validate_arguments(call.arguments)
         if error:
-            return f"错误:{error}"
+            return f"错误:{error}", False
 
         try:
             raw = tool.run(call.arguments)
         except Exception as e:
-            return f"错误：执行工具 '{call.name}' 时发生异常: {str(e)}"
+            return f"错误：执行工具 '{call.name}' 时发生异常: {str(e)}", False
 
         # 长度上限在这里施加, 而不是让每个工具自己记得调 —— 这是所有工具结果的
         # 唯一出口, 放在这儿才不会有漏网的。必须在结果进入 messages **之前**做:
         # 一旦写进轨迹, 它就成了"模型当年看到的"，事后再裁剪会让轨迹和真实请求对不上。
-        return tool.truncate_output(raw)
+        result = tool.truncate_output(raw)
 
-
-    # ==================== 旧: 工具描述文本(被 get_tools_schema 取代) ====================
-    # 把工具描述拼成一段文字塞进提示词, 让模型"照着文字说"要用哪个工具。
-    # function calling 下工具的说明走 API 的 tools 参数(JSON Schema), 不再需要这段文字。
-    # def get_tools_description(self) -> str:
-    #     """
-    #     获取所有可用工具的格式化描述字符串
-    #
-    #     Returns:
-    #         工具描述字符串，用于构建提示词
-    #     """
-    #     descriptions = []
-    #
-    #     # Tool对象描述
-    #     for tool in self._tools.values():
-    #         descriptions.append(f"- {tool.name}: {tool.description}")
-    #
-    #     # 函数工具描述
-    #     for name, info in self._functions.items():
-    #         descriptions.append(f"- {name}: {info['description']}")
-    #
-    #     return "\n".join(descriptions) if descriptions else "暂无可用工具"
+        # 工具自己吞掉的那个失败(它声明了 error_prefixes)也算失败
+        if tool.looks_like_error(result):
+            return result, False
+        return result, True
 
     def list_tools(self) -> list[str]:
         """列出所有工具名称"""
@@ -130,17 +135,9 @@ global_registry = ToolRegistry()
 
 
 # ==================== 已删除: 函数式注册 + 字符串参数执行 ====================
-# 这里原本还有 register_function / get_function / execute_tool 三个方法和一个
-# _functions 字典, 本次一并删掉了。理由:
-#
-# 1. 它们在 function calling 架构下**根本跑不通**。模型要调用一个工具, 前提是
-#    API 的 tools 参数里有它的 JSON Schema; 而 get_tools_schema() 只遍历 _tools,
-#    _functions 里的工具对模型完全不可见 —— 模型永远不会去调它, 于是那段代码
-#    永远等不到调用方。原来的注释写着"保留能用", 其实"不能用"。
-#
-# 2. execute_tool 走的是字符串参数 tool.run({"input": input_text}), 只能表达
-#    "一个字符串进、一个字符串出"。参数一旦是结构化的(比如计算器的 expression
-#    + 精度), 这么塞就会把参数名填错。
+# 这里原本还有 register_function / get_function / execute_tool 三个方法、
+# 一个 _functions 字典、以及一个 get_tools_description()。都已删除,
+# 原文和删除理由见本地归档 docs/archived-code.md 的《registry.py》一节。
 #
 # 想注册一个简单工具, 现在统一写成:
 #

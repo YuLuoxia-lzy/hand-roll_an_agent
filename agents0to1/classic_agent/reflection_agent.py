@@ -105,6 +105,26 @@ class ReflectionAgent(Agent):
         self.scratch = Scratchpad()
         self.custom_prompt = custom_prompt if custom_prompt else DEFAULT_PROMPTS
 
+    def _snapshot_state(self) -> dict:
+        """
+        把构造参数交给快照。
+
+        【不存会怎样】
+        `snapshot()["extra"]` 会是个空的 {}, `_from_snapshot` 于是拿不到这两个键,
+        load / fork 出来的 agent **静默退回默认值**: 你存的是一个
+        max_iterations=5、换了自定义提示词的 agent, 读回来的是 3 次迭代 +
+        默认提示词。整个过程中不会有任何提示 —— 快照测试"能读出来"也是绿的,
+        因为读出来的确实是个能用的 agent, 只是不是你存的那个。
+
+        (存的是**生效值**而不是构造参数原值: custom_prompt 传 None 时实际生效的是
+        DEFAULT_PROMPTS, 存 None 读回来也是 None, 结果一致, 但存生效值能让快照
+        本身可读 —— 打开文件就能看见这个 agent 用的到底是哪套提示词。)
+        """
+        return {
+            "max_iterations": self.max_iterations,
+            "custom_prompt": self.custom_prompt,
+        }
+
     def _run(self, input_text: str, **kwargs) -> str:
         """
         运行Reflection Agent
@@ -165,10 +185,7 @@ class ReflectionAgent(Agent):
         self._record_turn(input_text, final_result or "")
 
         return final_result
-        
 
-
-        #摒弃了长期记忆 如何实现长期记忆与短期记忆并行 且不冲突？
     def _get_llm_response(self, prompt: str, **kwargs) -> str:
         """
         调用LLM并获取完整响应。

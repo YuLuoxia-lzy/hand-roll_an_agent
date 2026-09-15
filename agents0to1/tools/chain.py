@@ -91,9 +91,31 @@ class ToolChain:
 
         Returns:
             最后一步的执行结果。任何一步失败就停止, 并返回错误信息。
+            (需要区分"结果"和"错误串"的调用方请用 execute_with_status。)
+        """
+        return self.execute_with_status(registry, initial_arguments)[0]
+
+    def execute_with_status(
+        self,
+        registry: ToolRegistry,
+        initial_arguments: Optional[Dict[str, Any]] = None,
+    ) -> tuple:
+        """
+        和 execute() 一样, 但额外告诉你成功还是失败。返回 (结果, ok)。
+
+        【为什么不是读结果前缀】
+        初版的判据是 `result.startswith("错误")` —— 那是拿**内容**当协议,
+        两头都会错:
+          - 假失败: 某个工具正常返回一段以"错误"开头的正文(检索到的报错日志、
+                    讲异常处理的文档), 链会就此中断, 而那次调用是成功的。
+          - 假成功: 计算器失败时返回 "计算失败: division by zero" —— 不匹配
+                    前缀。链会把这个字符串当结果继续往下传, 后面每一步都基于
+                    一个错值算, 最后交出一个**看起来算过、其实全是垃圾**的答案。
+        真正该问的是"这次执行失败了吗", 答案只有执行路径本身知道 ——
+        所以走 registry.execute_with_status()。
         """
         if not self.steps:
-            return "错误: 工具链为空, 无法执行"
+            return "错误: 工具链为空, 无法执行", False
 
         # 上下文 = 初始参数 + 各步骤结果, 占位符就从这个字典里取值
         context: Dict[str, Any] = dict(initial_arguments or {})
@@ -106,7 +128,7 @@ class ToolChain:
             try:
                 arguments = self._resolve_arguments(step.arguments, context)
             except ValueError as e:
-                return f"错误: 第 {i} 步的参数占位符无法解析 -> {e}"
+                return f"错误: 第 {i} 步的参数占位符无法解析 -> {e}", False
 
             # 2. 走 function calling 的标准执行路径
             call = ToolCall(
@@ -114,16 +136,16 @@ class ToolChain:
                 name=step.tool_name,
                 arguments=arguments,
             )
-            result = registry.execute(call)
+            result, ok = registry.execute_with_status(call)
 
-            # 3. 工具执行失败(registry 把错误作为字符串返回) -> 停止链条
-            if isinstance(result, str) and result.startswith("错误"):
-                return f"错误: 第 {i} 步 [{step.tool_name}] 执行失败 -> {result}"
+            # 3. 这一步失败了 -> 停止链条。**判据来自执行路径, 不是读结果字符串**
+            if not ok:
+                return f"错误: 第 {i} 步 [{step.tool_name}] 执行失败 -> {result}", False
 
             context[step.output_key] = result
             final_result = result
 
-        return final_result
+        return final_result, True
 
     def _resolve_arguments(self, value: Any, context: Dict[str, Any]) -> Any:
         """
@@ -192,10 +214,23 @@ class ToolChainManager:
 
     def execute_chain(self, chain_name: str, initial_arguments: Optional[Dict[str, Any]] = None) -> str:
         """执行指定的工具链"""
+        return self.execute_chain_with_status(chain_name, initial_arguments)[0]
+
+    def execute_chain_with_status(
+        self,
+        chain_name: str,
+        initial_arguments: Optional[Dict[str, Any]] = None,
+    ) -> tuple:
+        """
+        和 execute_chain() 一样, 但额外告诉你成功还是失败。返回 (结果, ok)。
+
+        多这一层的原因和 ToolChain.execute_with_status 完全一样: 上一层要是
+        还靠读前缀判断, 下面的修复就白做了 —— 错误信号在传上去的路上又丢了。
+        """
         chain = self.chains.get(chain_name)
         if chain is None:
-            return f"错误: 工具链 '{chain_name}' 不存在"
-        return chain.execute(self.registry, initial_arguments)
+            return f"错误: 工具链 '{chain_name}' 不存在", False
+        return chain.execute_with_status(self.registry, initial_arguments)
 
     def list_chains(self) -> List[str]:
         """列出所有已注册的工具链"""
@@ -222,92 +257,6 @@ class ToolChainManager:
         }
 
 
-# ==================== 旧版本(正则时代) - 注释保留, 仅供参考 ====================
-# 旧版的问题:
-# 1. 参数走字符串接口 execute_tool(name, input_text), 底层传 {"input": ...},
-#    但 function calling 的工具参数名各不相同(计算器是 expression, 搜索是 query)。
-# 2. 变量替换 input_template.format(**context) 只能把上一步的整个输出塞进下一步,
-#    无法"从结果里取出某个字段"填进对应的参数名。
-# 3. 便捷函数写死了不存在的工具名 "my_calculator", 一跑就报"未找到工具"。
-#
-# class ToolChain:
-#     """工具链 - 支持多个工具的顺序执行"""
-#
-#     def __init__(self, name: str, description: str):
-#         self.name = name
-#         self.description = description
-#         self.steps: List[Dict[str, Any]] = []
-#
-#     def add_step(self, tool_name: str, input_template: str, output_key: str = None):
-#         step = {
-#             "tool_name": tool_name,
-#             "input_template": input_template,
-#             "output_key": output_key or f"step_{len(self.steps)}_result"
-#         }
-#         self.steps.append(step)
-#         print(f"✅ 工具链 '{self.name}' 添加步骤: {tool_name}")
-#
-#     def execute(self, registry: ToolRegistry, input_data: str, context: Dict[str, Any] = None) -> str:
-#         if not self.steps:
-#             return "❌ 工具链为空，无法执行"
-#
-#         print(f"🚀 开始执行工具链: {self.name}")
-#
-#         if context is None:
-#             context = {}
-#         context["input"] = input_data
-#
-#         final_result = input_data
-#
-#         for i, step in enumerate(self.steps):
-#             tool_name = step["tool_name"]
-#             input_template = step["input_template"]
-#             output_key = step["output_key"]
-#
-#             try:
-#                 actual_input = input_template.format(**context)
-#             except KeyError as e:
-#                 return f"❌ 模板变量替换失败: {e}"
-#
-#             try:
-#                 result = registry.execute_tool(tool_name, actual_input)
-#                 context[output_key] = result
-#                 final_result = result
-#             except Exception as e:
-#                 return f"❌ 工具 '{tool_name}' 执行失败: {e}"
-#
-#         return final_result
-#
-#
-# class ToolChainManager:
-#     """工具链管理器"""
-#
-#     def __init__(self, registry: ToolRegistry):
-#         self.registry = registry
-#         self.chains: Dict[str, ToolChain] = {}
-#
-#     def register_chain(self, chain: ToolChain):
-#         self.chains[chain.name] = chain
-#         print(f"✅ 工具链 '{chain.name}' 已注册")
-#
-#     def execute_chain(self, chain_name: str, input_data: str, context: Dict[str, Any] = None) -> str:
-#         if chain_name not in self.chains:
-#             return f"❌ 工具链 '{chain_name}' 不存在"
-#         chain = self.chains[chain_name]
-#         return chain.execute(self.registry, input_data, context)
-#
-#
-# # 便捷函数: 写死了不存在的工具名 "my_calculator"(实际是 "python_calculator"), 已废弃
-# def create_research_chain() -> ToolChain:
-#     """创建一个研究工具链：搜索 -> 计算 -> 总结"""
-#     chain = ToolChain(name="research_and_calculate", description="搜索信息并进行相关计算")
-#     chain.add_step(tool_name="search", input_template="{input}", output_key="search_result")
-#     chain.add_step(tool_name="my_calculator", input_template="2 + 2", output_key="calc_result")
-#     return chain
-#
-#
-# def create_simple_chain() -> ToolChain:
-#     """创建一个简单的工具链示例"""
-#     chain = ToolChain(name="simple_demo", description="简单的工具链演示")
-#     chain.add_step(tool_name="my_calculator", input_template="{input}", output_key="result")
-#     return chain
+# ==================== 旧版本(正则时代) ====================
+# 原文和逐条问题见本地归档 docs/archived-code.md 的《chain.py》一节。一句话版:
+# 参数走字符串接口、模板替换只能整段塞、便捷函数写死了不存在的工具名。

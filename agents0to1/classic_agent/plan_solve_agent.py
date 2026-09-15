@@ -107,18 +107,9 @@ class Planner:
 
         return plan
 
-        # try:
-        #     # 提取Python代码块中的列表
-        #     plan_str = response_text.split("```python")[1].split("```")[0].strip()
-        #     plan = ast.literal_eval(plan_str) #将字符串转为python可识别的 在这里为转为list
-        #     return plan if isinstance(plan, list) else []
-        # except (ValueError, SyntaxError, IndexError) as e:
-        #     print(f"❌ 解析计划时出错: {e}")
-        #     print(f"原始响应: {response_text}")
-        #     return []
-        # except Exception as e:
-        #     print(f"❌ 解析计划时发生未知错误: {e}")
-        #     return []
+        # (上一版这里还有一段"从 ```python 代码块里 ast.literal_eval 出计划"的解析器,
+        #  以及三个把失败 print 出来就完事的 except —— 原文见本地归档 docs/archived-code.md)
+
 
 class Executor:
     """执行器 - 负责按计划逐步执行"""
@@ -224,7 +215,28 @@ class PlanAndSolveAgent(Agent):
         # system_prompt 才真的会进请求体。
         self.planner = Planner(self, planner_prompt)
         self.executor = Executor(self, executor_prompt)
-    
+
+    def _snapshot_state(self) -> dict:
+        """
+        把构造参数交给快照。
+
+        【不存会怎样】
+        `snapshot()["extra"]` 是个空的 {}, load / fork 出来的 agent 会**静默退回
+        默认提示词** —— 你存的是一个换了规划器提示词的 agent, 读回来的是原装的,
+        而两边都不会报错。fork 出来的那份尤其阴: 它看起来能跑、答得也像模像样,
+        只是用的不是你 fork 时的那套提示词, 于是"对照实验"的两个分支根本不是
+        同一个实验。
+
+        存规划器/执行器**当前生效的模板**(而不是 custom_prompts 那个参数):
+        传 None 时生效的是两个 DEFAULT_*, 存生效值, 快照打开就能读。
+        """
+        return {
+            "custom_prompts": {
+                "planner": self.planner.prompt_template,
+                "executor": self.executor.prompt_template,
+            }
+        }
+
     def _run(self, input_text: str, **kwargs) -> str:
         """
         运行Plan and Solve Agent
